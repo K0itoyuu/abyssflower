@@ -131,7 +131,70 @@ fn collect_imports(cf: &ClassFile) -> BTreeSet<String> {
 
         imports.insert(name.replace('/', "."));
     }
+
+    // Annotation types live in the constant pool as UTF-8 descriptors, not
+    // Class entries, so they need collecting separately — otherwise a class
+    // using @Mixin / @Inject / @At renders those names unqualified with no
+    // matching import.
+    let mut add_ann = |anns: &[Annotation], imports: &mut BTreeSet<String>| {
+        collect_annotation_imports(anns, this_pkg, &cf.this_class, imports);
+    };
+    for attrs in std::iter::once(&cf.attributes)
+        .chain(cf.fields.iter().map(|f| &f.attributes))
+        .chain(cf.methods.iter().map(|m| &m.attributes))
+    {
+        for attr in attrs {
+            match attr {
+                Attribute::RuntimeVisibleAnnotations(a)
+                | Attribute::RuntimeInvisibleAnnotations(a) => add_ann(a, &mut imports),
+                Attribute::RuntimeVisibleParameterAnnotations(groups)
+                | Attribute::RuntimeInvisibleParameterAnnotations(groups) => {
+                    for g in groups { add_ann(g, &mut imports); }
+                }
+                _ => {}
+            }
+        }
+    }
+
     imports
+}
+
+/// Walk an annotation tree, adding every annotation type (including nested
+/// annotations and those inside array values) to the import set.
+fn collect_annotation_imports(
+    anns: &[Annotation],
+    this_pkg: &str,
+    this_class: &str,
+    imports: &mut BTreeSet<String>,
+) {
+    fn visit_value(
+        v: &ElementValue, this_pkg: &str, this_class: &str, imports: &mut BTreeSet<String>,
+    ) {
+        match v {
+            ElementValue::Annotation(a) =>
+                collect_annotation_imports(std::slice::from_ref(a), this_pkg, this_class, imports),
+            ElementValue::Array(elems) =>
+                for e in elems { visit_value(e, this_pkg, this_class, imports); },
+            _ => {}
+        }
+    }
+
+    for ann in anns {
+        let binary = ann.type_descriptor
+            .trim_start_matches('L')
+            .trim_end_matches(';');
+        if binary.contains('/') && binary != this_class {
+            let pkg = binary.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+            let is_java_lang = binary.starts_with("java/lang/")
+                && !binary["java/lang/".len()..].contains('/');
+            if pkg != this_pkg && !is_java_lang {
+                imports.insert(binary.replace('/', "."));
+            }
+        }
+        for (_, v) in &ann.elements {
+            visit_value(v, this_pkg, this_class, imports);
+        }
+    }
 }
 
 // ── public entry ──────────────────────────────────────────────────────────
