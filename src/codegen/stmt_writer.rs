@@ -153,6 +153,12 @@ fn render_stmt_stacked(
                         // ── Value guard-chain fold ─────────────────────────────
                         // `if (A) { [if (B) { ] push_X [}] }` + push_Y
                         // → stack value `A [&& B] ? X : Y` (consumed by next stmt)
+                        //
+                        // The outer If's cond_insns may push extra values BEFORE the
+                        // branch operand (e.g. `this` and `yRot+180f` for a later
+                        // setRotation call).  Compute cbs from those instructions and
+                        // prepend to the ternary result so the consumer block has a
+                        // complete initial_stack.
                         let else_residual = silent_eval(
                             arena, next_id, vec![], pool, is_static, this_class, names);
                         if else_residual.len() == 1 {
@@ -167,8 +173,17 @@ fn render_stmt_stacked(
                                     then_expr: Box::new(then_slot.expr),
                                     else_expr: Box::new(else_slot.expr),
                                 };
+                                // Prepend any pre-condition values pushed by the outer If.
+                                let mut new_stack = if let Stmt::If(s) = arena.get(child) {
+                                    cond_base_stack(
+                                        &s.cond_insns, pool, stack.clone(),
+                                        is_static, this_class, names)
+                                } else {
+                                    stack.clone()
+                                };
+                                new_stack.push(SlotInfo { expr: ternary, ty });
                                 i += 2;
-                                stack = vec![SlotInfo { expr: ternary, ty }];
+                                stack = new_stack;
                                 continue;
                             }
                         }
@@ -262,6 +277,34 @@ fn render_stmt_stacked(
                 let mut base = cbs;
                 base.push(SlotInfo { expr: ternary, ty });
                 return base;
+            }
+
+            // ── Compound guard-chain + outer-else value fold ──────────────────
+            // Pattern: `if (A) { if (B) { push X } } else { push Y }`
+            // where the inner If has no else (recovery assigned the shared else-block
+            // only to the outer If).  then_residual is [] but the then_branch itself
+            // is a no-else guard chain whose leaf pushes a single value.
+            // → fold to `A && B ? X : Y`, push result onto cbs.
+            if then_residual.is_empty() && else_residual.len() == 1 && s.else_branch.is_some() {
+                if let Some((inner_conds, then_slot)) = try_extract_guard_chain_value(
+                    arena, s.then_branch, pool, is_static, this_class, names)
+                {
+                    let outer_cond = condition_from_block_insns(
+                        &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                    let mut all_conds = vec![outer_cond];
+                    all_conds.extend(inner_conds);
+                    let compound_cond = all_conds.join(" && ");
+                    let else_slot = else_residual.into_iter().next().unwrap();
+                    let ty = then_slot.ty.clone();
+                    let ternary = Expr::Ternary {
+                        cond: compound_cond,
+                        then_expr: Box::new(then_slot.expr),
+                        else_expr: Box::new(else_slot.expr),
+                    };
+                    let mut base = cbs;
+                    base.push(SlotInfo { expr: ternary, ty });
+                    return base;
+                }
             }
 
             render_if(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
@@ -368,6 +411,28 @@ fn silent_eval(
                     else_expr: Box::new(else_r.into_iter().next().unwrap().expr),
                 };
                 vec![SlotInfo { expr: ternary, ty }]
+            } else if then_r.is_empty() && else_r.len() == 1 && s.else_branch.is_some() {
+                // Compound guard-chain + outer-else:
+                // `if (A) { if (B) { push X } } else { push Y }` → A && B ? X : Y
+                if let Some((inner_conds, then_slot)) = try_extract_guard_chain_value(
+                    arena, s.then_branch, pool, is_static, this_class, names)
+                {
+                    let outer_cond = condition_from_block_insns(
+                        &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                    let mut all_conds = vec![outer_cond];
+                    all_conds.extend(inner_conds);
+                    let compound_cond = all_conds.join(" && ");
+                    let else_slot = else_r.into_iter().next().unwrap();
+                    let ty = then_slot.ty.clone();
+                    let ternary = crate::ir::expr::Expr::Ternary {
+                        cond: compound_cond,
+                        then_expr: Box::new(then_slot.expr),
+                        else_expr: Box::new(else_slot.expr),
+                    };
+                    vec![SlotInfo { expr: ternary, ty }]
+                } else {
+                    vec![]
+                }
             } else {
                 vec![]
             }
