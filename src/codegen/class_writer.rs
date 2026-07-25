@@ -1,0 +1,678 @@
+/// Class-level code generator.
+/// Renders a parsed ClassFile + its structured IR into a complete Java source file.
+use crate::cfg::{builder as cfg_builder, DomTree};
+use crate::classfile::attribute::{Attribute, BootstrapMethod};
+use crate::classfile::constant_pool::{CpEntry, ConstantPool};
+use crate::classfile::member::{flags, Field, Method};
+use crate::classfile::ClassFile;
+use crate::codegen::expr_writer::{simple_name, IndentWriter};
+use crate::codegen::stmt_writer::render_method_body;
+use crate::ir::recovery::recover;
+use crate::types::descriptor::{parse_field_descriptor, MethodDescriptor};
+use crate::types::java_type::JavaType;
+use crate::types::signature::{
+    parse_class_signature, parse_field_signature, parse_method_signature, GenericType,
+};
+use std::collections::{BTreeSet, HashMap};
+
+// ── Lambda body cache ─────────────────────────────────────────────────────
+// Two thread-locals:
+// (1) method name → lambda body string (populated before method rendering)
+// (2) bootstrap_attr_index → lambda body string (for InvokeDynamic lookup)
+thread_local! {
+    pub(crate) static LAMBDA_BODIES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+    pub(crate) static LAMBDA_BOOTSTRAP: std::cell::RefCell<HashMap<u16, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+// ── import collection ─────────────────────────────────────────────────────
+
+/// Return a sorted, de-duped set of fully-qualified class names that should
+/// be imported.  We scan the constant pool for Class entries and keep only
+/// those in a different package from `this_class`, not in `java.lang`, and
+/// not array types.
+fn collect_imports(cf: &ClassFile) -> BTreeSet<String> {
+    let this_pkg = cf.this_class.rsplit_once('/')
+        .map(|(p, _)| p)
+        .unwrap_or("");
+
+    let mut imports = BTreeSet::new();
+
+    for entry in cf.constant_pool.entries() {
+        let name = match entry {
+            CpEntry::Class(n)   => n.as_str(),
+            CpEntry::Fieldref(mr) | CpEntry::Methodref(mr)
+            | CpEntry::InterfaceMethodref(mr) => mr.class_name.as_str(),
+            _ => continue,
+        };
+        // Skip arrays, primitives, the class itself
+        if name.starts_with('[') || !name.contains('/') { continue; }
+        if name == cf.this_class { continue; }
+        // Skip java.lang.*
+        if name.starts_with("java/lang/") && !name["java/lang/".len()..].contains('/') {
+            continue;
+        }
+        // Skip same-package types
+        let pkg = name.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if pkg == this_pkg { continue; }
+
+        imports.insert(name.replace('/', "."));
+    }
+    imports
+}
+
+// ── public entry ──────────────────────────────────────────────────────────
+
+/// Render a full class file to Java source code.
+pub fn render_class(cf: &ClassFile) -> String {
+    let mut w = IndentWriter::new(4);
+
+    // ── 1. Pre-compile lambda$* methods (outside thread-local borrow) ──
+    // Build a plain HashMap first, then store it — avoids borrow conflicts
+    // if decompile_lambda_body triggers any thread-local access.
+    let mut lambda_map: HashMap<String, String> = HashMap::new();
+    for m in &cf.methods {
+        if !m.name.starts_with("lambda$") { continue; }
+        if let Some(code) = m.code() {
+            let body = decompile_lambda_body(m, code, cf);
+            lambda_map.insert(m.name.clone(), body);
+        }
+    }
+    LAMBDA_BODIES.with(|cache| { *cache.borrow_mut() = lambda_map.clone(); });
+
+    // ── 2. Build bootstrap_index → lambda body map ────────────────────
+    // For each LambdaMetafactory bootstrap: determine SAM param count from arg[0]
+    // (the functional interface method type), then build `(params) -> body`
+    // using only the trailing SAM params (not the captured variables).
+    let mut bootstrap_map: HashMap<u16, String> = HashMap::new();
+    let bootstrap_methods: Vec<BootstrapMethod> = cf.attributes.iter()
+        .filter_map(|a| if let Attribute::BootstrapMethods(bms) = a { Some(bms) } else { None })
+        .flat_map(|bms| bms.iter().cloned())
+        .collect();
+
+    for (idx, bm) in bootstrap_methods.iter().enumerate() {
+        let is_lambda_factory = match cf.constant_pool.get(bm.bootstrap_method_ref) {
+            Ok(CpEntry::MethodHandle { reference, .. }) => match reference.as_ref() {
+                CpEntry::Methodref(mr) | CpEntry::InterfaceMethodref(mr) =>
+                    mr.class_name.contains("LambdaMetafactory") &&
+                    (mr.name == "metafactory" || mr.name == "altMetafactory"),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_lambda_factory { continue; }
+
+        // arg[0] = SAM method type  (e.g. "()Ljava/lang/Object;")
+        // arg[1] = impl MethodHandle
+        // arg[2] = instantiated method type
+        let sam_type_idx = match bm.arguments.get(0) { Some(&i) => i, None => continue };
+        let impl_handle_idx = match bm.arguments.get(1) { Some(&i) => i, None => continue };
+
+        // Get SAM param count from the MethodType descriptor
+        let sam_param_count = match cf.constant_pool.get(sam_type_idx) {
+            Ok(CpEntry::MethodType(desc)) =>
+                MethodDescriptor::parse(desc)
+                    .map(|md| md.params.len())
+                    .unwrap_or(0),
+            _ => 0,
+        };
+
+        // Get impl method name and full descriptor
+        let (impl_name, impl_desc) = match cf.constant_pool.get(impl_handle_idx) {
+            Ok(CpEntry::MethodHandle { reference, .. }) => match reference.as_ref() {
+                CpEntry::Methodref(mr) | CpEntry::InterfaceMethodref(mr) =>
+                    (mr.name.clone(), mr.descriptor.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+
+        if let Some(raw_body) = lambda_map.get(&impl_name) {
+            // Build lambda param list from the last `sam_param_count` params of impl method
+            let impl_md = MethodDescriptor::parse(&impl_desc)
+                .unwrap_or_else(|_| MethodDescriptor { params: vec![], return_type: JavaType::VOID });
+            let total_params = impl_md.params.len();
+            let captured_count = total_params.saturating_sub(sam_param_count);
+
+            // Get param names from the impl method's LVT
+            let impl_lvt: Vec<String> = cf.methods.iter()
+                .find(|m| m.name == impl_name && m.descriptor == impl_desc)
+                .map(|m| extract_param_names_from_lvt(m, false))
+                .unwrap_or_default();
+
+            let lambda_params: Vec<String> = impl_md.params.iter()
+                .enumerate()
+                .skip(captured_count)
+                .map(|(i, ty)| {
+                    let name = impl_lvt.get(i).cloned()
+                        .unwrap_or_else(|| format!("p{}", i - captured_count));
+                    format!("{} {}", ty, name)
+                })
+                .collect();
+            let params_str = lambda_params.join(", ");
+
+            // Build the final lambda expression
+            let body_trimmed = raw_body.trim();
+            let lambda_expr = if body_trimmed.contains('\n') {
+                format!("({}) -> {{\n{}\n}}", params_str, body_trimmed)
+            } else {
+                let expr = body_trimmed.trim_end_matches(';');
+                let expr = expr.trim_start_matches("return ").trim();
+                format!("({}) -> {}", params_str, expr)
+            };
+            bootstrap_map.insert(idx as u16, lambda_expr);
+        }
+    }
+    LAMBDA_BOOTSTRAP.with(|cache| { *cache.borrow_mut() = bootstrap_map; });
+
+    // ── package declaration ────────────────────────────────────────────
+    let this = &cf.this_class;
+    if let Some(slash) = this.rfind('/') {
+        let pkg = this[..slash].replace('/', ".");
+        w.line(&format!("package {};", pkg));
+        w.line("");
+    }
+
+    // ── imports ────────────────────────────────────────────────────────
+    let imports = collect_imports(cf);
+    if !imports.is_empty() {
+        for imp in &imports {
+            w.line(&format!("import {};", imp));
+        }
+        w.line("");
+    }
+
+    // ── class-level annotations ────────────────────────────────────────
+    for attr in &cf.attributes {
+        if let Attribute::RuntimeVisibleAnnotations(anns) = attr {
+            for ann in anns {
+                let name = ann.type_descriptor
+                    .trim_start_matches('L')
+                    .trim_end_matches(';');
+                w.line(&format!("@{}", name.replace('/', ".")));
+            }
+        }
+    }
+
+    // ── class declaration ──────────────────────────────────────────────
+    let decl = build_class_declaration(cf);
+    w.line(&format!("{} {{", decl));
+    w.indent();
+
+    if cf.is_enum() {
+        // ── enum constants (A, B, C;) ──────────────────────────────────
+        let enum_consts: Vec<&Field> = cf.fields.iter()
+            .filter(|f| f.is_enum())
+            .collect();
+        if !enum_consts.is_empty() {
+            w.line("");
+            let names: Vec<&str> = enum_consts.iter().map(|f| f.name.as_str()).collect();
+            w.line(&format!("{};", names.join(",\n    ")));
+        }
+
+        // ── non-enum fields (e.g. custom state fields) ─────────────────
+        let extra_fields: Vec<&Field> = cf.fields.iter()
+            .filter(|f| !f.is_enum() && !should_skip_field(f))
+            .collect();
+        for f in extra_fields {
+            w.line("");
+            render_field(f, &mut w);
+        }
+    } else {
+        // ── regular fields ─────────────────────────────────────────────
+        let visible_fields: Vec<&Field> = cf.fields.iter()
+            .filter(|f| !should_skip_field(f))
+            .collect();
+        if !visible_fields.is_empty() { w.line(""); }
+        for f in visible_fields {
+            render_field(f, &mut w);
+        }
+    }
+
+    // ── methods ────────────────────────────────────────────────────────
+    for m in &cf.methods {
+        w.line("");
+        render_method(m, cf, &mut w);
+    }
+
+    w.dedent();
+    w.line("}");
+
+    w.finish()
+}
+
+// ── class declaration line ─────────────────────────────────────────────────
+
+fn build_class_declaration(cf: &ClassFile) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if cf.access_flags & flags::PUBLIC    != 0 { parts.push("public"); }
+    if cf.access_flags & flags::ABSTRACT  != 0 && !cf.is_interface() { parts.push("abstract"); }
+    if cf.access_flags & flags::FINAL     != 0 && !cf.is_enum()      { parts.push("final"); }
+
+    let kind = if cf.is_annotation() { "@interface" }
+               else if cf.is_interface() { "interface" }
+               else if cf.is_enum()  { "enum" }
+               else { "class" };
+
+    let simple = cf.this_class.rsplit('/').next().unwrap_or(&cf.this_class)
+        .replace('$', ".");
+
+    // Generic signature if available — validate against bytecode before using
+    let mut extends_str  = String::new();
+    let mut implements_str = String::new();
+    let mut type_params_str = String::new();
+
+    let sig_valid = cf.signature().map(|sig_str| {
+        parse_class_signature(sig_str).map(|sig| {
+            // Validate: each superinterface's erased type must match bytecode interfaces[]
+            let ifaces_ok = sig.superinterfaces.iter().zip(cf.interfaces.iter()).all(|(st, bi)| {
+                signature_erased_matches(st, bi)
+            });
+            // Validate: superclass erased type must match bytecode super_class
+            let super_ok = cf.super_class.as_deref()
+                .map(|bs| signature_erased_matches(&sig.superclass, bs))
+                .unwrap_or(true);
+            (ifaces_ok && super_ok, sig)
+        }).ok()
+    }).flatten();
+
+    if let Some((true, sig)) = sig_valid {
+        if !sig.type_params.is_empty() {
+            type_params_str = format!("<{}>",
+                sig.type_params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "));
+        }
+        let sup = sig.superclass.to_string();
+        if sup != "java.lang.Object" && !cf.is_enum() {
+            extends_str = format!(" extends {}", sup);
+        }
+        if !sig.superinterfaces.is_empty() {
+            let kw = if cf.is_interface() { " extends " } else { " implements " };
+            implements_str = format!("{}{}", kw,
+                sig.superinterfaces.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
+        }
+    } else {
+        if let Some(sup) = &cf.super_class {
+            if sup != "java/lang/Object" && !cf.is_enum() {
+                extends_str = format!(" extends {}", simple_name(sup));
+            }
+        }
+        if !cf.interfaces.is_empty() {
+            let kw = if cf.is_interface() { " extends " } else { " implements " };
+            implements_str = format!("{}{}", kw,
+                cf.interfaces.iter().map(|i| simple_name(i)).collect::<Vec<_>>().join(", "));
+        }
+    }
+
+    format!("{} {}{}{}{}{}", parts.join(" "), kind, type_params_str, " ", simple,
+            format!("{}{}", extends_str, implements_str))
+}
+
+// ── signature validation ────────────────────────────────────────────────────
+
+/// Check that the erased form of a generic type matches a bytecode binary name.
+/// We erase by taking the raw class name from the signature (ignoring type args).
+/// If they match, the signature is trustworthy; if not, fall back to bytecode.
+fn signature_erased_matches(sig_ty: &GenericType, bytecode_binary: &str) -> bool {
+    let erased = match sig_ty {
+        GenericType::Class { class_name, .. } => class_name.replace('.', "/"),
+        GenericType::Base(jt) => {
+            // For primitives, check the descriptor char
+            return jt.to_string() == bytecode_binary.replace('/', ".");
+        }
+        GenericType::TypeVar(_) => return true, // type var — trust it
+        GenericType::Array { element, dims } => {
+            // array: prepend [
+            let inner = match element.as_ref() {
+                GenericType::Class { class_name, .. } =>
+                    format!("{}{}", "[".repeat(*dims as usize), class_name.replace('.', "/")),
+                _ => return true,
+            };
+            inner
+        }
+    };
+    erased == bytecode_binary
+}
+
+// ── field rendering ────────────────────────────────────────────────────────
+
+/// Returns true if a field should be hidden from the output.
+/// We hide compiler-generated synthetic fields that aren't part of the
+/// original source (e.g. `this$0`, `$SWITCH_TABLE$…`, `$VALUES`).
+fn should_skip_field(f: &Field) -> bool {
+    if f.is_synthetic() { return true; }
+    // Inner-class outer-this reference
+    if f.name.starts_with("this$") { return true; }
+    // javac enum switch table cache
+    if f.name.starts_with("$SWITCH_TABLE$") { return true; }
+    // Enum values array (we render enum constants separately)
+    // Only skip if it's a static final field named $VALUES or ENUM$VALUES
+    if (f.name == "$VALUES" || f.name == "ENUM$VALUES") && f.is_static() && f.is_final() {
+        return true;
+    }
+    false
+}
+
+fn render_field(f: &Field, w: &mut IndentWriter) {
+    let mut mods: Vec<&str> = Vec::new();
+    if f.access_flags & flags::PUBLIC    != 0 { mods.push("public"); }
+    if f.access_flags & flags::PROTECTED != 0 { mods.push("protected"); }
+    if f.access_flags & flags::PRIVATE   != 0 { mods.push("private"); }
+    if f.is_static()   { mods.push("static"); }
+    if f.is_final()    { mods.push("final"); }
+    if f.is_volatile() { mods.push("volatile"); }
+    if f.is_transient(){ mods.push("transient"); }
+
+    let type_str = field_type_str(f);
+    let mods_str = mods.join(" ");
+    let separator = if mods_str.is_empty() { "" } else { " " };
+
+    let const_val = field_constant_value(f);
+    if let Some(val) = const_val {
+        w.line(&format!("{}{}{} {} = {};", mods_str, separator, type_str, f.name, val));
+    } else {
+        w.line(&format!("{}{}{} {};", mods_str, separator, type_str, f.name));
+    }
+}
+
+fn field_type_str(f: &Field) -> String {
+    // Use Signature attribute only if its erased type matches the bytecode descriptor.
+    for attr in &f.attributes {
+        if let Attribute::Signature(sig) = attr {
+            if let Ok(fs) = parse_field_signature(sig) {
+                // Erased type from signature must match bytecode descriptor's class name
+                let sig_ok = field_sig_matches_descriptor(&fs.ty, &f.descriptor);
+                if sig_ok {
+                    return fs.ty.to_string();
+                }
+            }
+        }
+    }
+    parse_field_descriptor(&f.descriptor)
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_else(|_| f.descriptor.clone())
+}
+
+/// Check that the erased class name from a field signature matches the bytecode descriptor.
+/// Descriptor looks like `Ljava/util/List;` for an object field.
+fn field_sig_matches_descriptor(sig_ty: &GenericType, descriptor: &str) -> bool {
+    let desc_class = if descriptor.starts_with('L') && descriptor.ends_with(';') {
+        &descriptor[1..descriptor.len()-1]
+    } else {
+        return true; // primitive or array — skip check
+    };
+    signature_erased_matches(sig_ty, desc_class)
+}
+
+fn field_constant_value(f: &Field) -> Option<String> {
+    for attr in &f.attributes {
+        if let Attribute::ConstantValue(_) = attr {
+            // The actual value resolution requires the constant pool;
+            // for now emit a placeholder that can be filled in later.
+            return Some("/* const */".into());
+        }
+    }
+    None
+}
+
+// ── method rendering ───────────────────────────────────────────────────────
+
+fn render_method(m: &Method, cf: &ClassFile, w: &mut IndentWriter) {
+    // Skip bridge/synthetic methods
+    if m.is_bridge() || (m.is_synthetic() && !m.name.starts_with('<')) { return; }
+
+    // Skip trivial default constructor
+    if m.is_constructor() && is_default_constructor(m, cf) { return; }
+
+    // For enums: skip compiler-generated boilerplate
+    if cf.is_enum() {
+        // Skip values() — always compiler-generated
+        if m.name == "values" && m.descriptor.starts_with("()[L") { return; }
+        // Skip valueOf(String) — always compiler-generated
+        if m.name == "valueOf" && m.descriptor.starts_with("(Ljava/lang/String;)") { return; }
+        // Skip the private (String, int) constructor that calls super(Enum)
+        if m.is_constructor() && m.descriptor == "(Ljava/lang/String;I)V" { return; }
+        // Skip <clinit> — the static initializer that sets up $VALUES is all compiler noise
+        if m.is_static_init() { return; }
+    } else {
+        // For non-enum classes: skip empty <clinit>
+        if m.is_static_init() {
+            if let Some(code) = m.code() {
+                if code.instructions.is_empty() { return; }
+            }
+        }
+    }
+
+    // Skip lambda implementation methods (lambda$name$N)
+    if m.name.starts_with("lambda$") { return; }
+
+    // ── method annotations ─────────────────────────────────────────────
+    for attr in &m.attributes {
+        if let Attribute::RuntimeVisibleAnnotations(anns) = attr {
+            for ann in anns {
+                let name = ann.type_descriptor
+                    .trim_start_matches('L').trim_end_matches(';');
+                w.line(&format!("@{}", name.replace('/', ".")));
+            }
+        }
+    }
+
+    let decl = build_method_declaration(m, cf);
+
+    let code_opt = m.code();
+    if m.is_abstract() || m.is_native() || code_opt.is_none() {
+        w.line(&format!("{};", decl));
+        return;
+    }
+
+    w.line(&format!("{} {{", decl));
+    w.indent();
+
+    let code = code_opt.unwrap();
+    let body = decompile_method_body(m, code, cf);
+    w.push_str(&body);
+
+    w.dedent();
+    w.line("}");
+}
+
+fn build_method_declaration(m: &Method, cf: &ClassFile) -> String {
+    let mut mods: Vec<&str> = Vec::new();
+    if m.access_flags & flags::PUBLIC    != 0 { mods.push("public"); }
+    if m.access_flags & flags::PROTECTED != 0 { mods.push("protected"); }
+    if m.access_flags & flags::PRIVATE   != 0 { mods.push("private"); }
+    if m.is_static()       { mods.push("static"); }
+    if m.is_final()        { mods.push("final"); }
+    if m.is_abstract()     { mods.push("abstract"); }
+    if m.is_native()       { mods.push("native"); }
+    if m.is_synchronized() { mods.push("synchronized"); }
+
+    let simple_class = cf.this_class.rsplit('/').next().unwrap_or(&cf.this_class);
+
+    // Handle generic signature
+    let (type_params, params_str, ret_str, throws_str) =
+        if let Some(sig_str) = method_signature(m) {
+            match parse_method_signature(&sig_str) {
+                Ok(ms) => {
+                    let tp = if ms.type_params.is_empty() { String::new() }
+                             else { format!("<{}> ", ms.type_params.iter()
+                                 .map(|p| p.to_string()).collect::<Vec<_>>().join(", ")) };
+                    let params = format_generic_params(&ms.params, m);
+                    let ret  = ms.return_type.to_string();
+                    let thr  = if ms.throws.is_empty() { String::new() }
+                               else { format!(" throws {}",
+                                   ms.throws.iter().map(|t| t.to_string())
+                                       .collect::<Vec<_>>().join(", ")) };
+                    (tp, params, ret, thr)
+                }
+                Err(_) => fallback_method_parts(m),
+            }
+        } else {
+            fallback_method_parts(m)
+        };
+
+    let mods_str = mods.join(" ");
+    let sep = if mods_str.is_empty() { "" } else { " " };
+
+    if m.is_constructor() {
+        format!("{}{}{}{}{}{}",
+            mods_str, sep, type_params, simple_class, params_str, throws_str)
+    } else if m.is_static_init() {
+        "static".into()
+    } else {
+        format!("{}{}{}{} {}{}{}",
+            mods_str, sep, type_params, ret_str, m.name, params_str, throws_str)
+    }
+}
+
+fn method_signature(m: &Method) -> Option<String> {
+    m.attributes.iter().find_map(|a| {
+        if let Attribute::Signature(s) = a { Some(s.clone()) } else { None }
+    })
+}
+
+fn format_generic_params(
+    params: &[crate::types::signature::GenericType],
+    m: &Method,
+) -> String {
+    // Try to match parameter names from MethodParameters attribute
+    let names: Vec<Option<String>> = m.attributes.iter()
+        .find_map(|a| if let Attribute::MethodParameters(ps) = a { Some(ps) } else { None })
+        .map(|ps| ps.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+
+    let parts: Vec<String> = params.iter().enumerate().map(|(i, ty)| {
+        let name = names.get(i).and_then(|n| n.as_deref())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("param{}", i));
+        format!("{} {}", ty, name)
+    }).collect();
+    format!("({})", parts.join(", "))
+}
+
+fn fallback_method_parts(m: &Method) -> (String, String, String, String) {
+    let md = MethodDescriptor::parse(&m.descriptor)
+        .unwrap_or_else(|_| MethodDescriptor { params: vec![], return_type: JavaType::VOID });
+
+    // LVT start_pc=0 entries are parameters — prefer those over "param<i>" placeholders.
+    let lvt_param_names = extract_param_names_from_lvt(m, !m.is_static());
+    let mp_names: Vec<Option<String>> = m.attributes.iter()
+        .find_map(|a| if let Attribute::MethodParameters(ps) = a { Some(ps) } else { None })
+        .map(|ps| ps.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+
+    let parts: Vec<String> = md.params.iter().enumerate().map(|(i, ty)| {
+        let name = lvt_param_names.get(i).cloned()
+            .or_else(|| mp_names.get(i).and_then(|n| n.as_deref()).map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("param{}", i));
+        format!("{} {}", ty, name)
+    }).collect();
+
+    let params_str = format!("({})", parts.join(", "));
+    let ret_str    = md.return_type.to_string();
+
+    let throws_str = m.attributes.iter().find_map(|a| {
+        if let Attribute::Exceptions(ex) = a {
+            if !ex.exception_names.is_empty() {
+                return Some(format!(" throws {}",
+                    ex.exception_names.iter()
+                        .map(|n| simple_name(n))
+                        .collect::<Vec<_>>()
+                        .join(", ")));
+            }
+        }
+        None
+    }).unwrap_or_default();
+
+    (String::new(), params_str, ret_str, throws_str)
+}
+
+/// Extract parameter names from LVT: entries with start_pc=0 are parameter slots.
+/// `has_this` skips slot 0 ("this") for instance methods.
+/// Returns names in parameter-index order.
+fn extract_param_names_from_lvt(m: &Method, has_this: bool) -> Vec<String> {
+    let lvt = m.code()
+        .and_then(|code| code.attributes.iter().find_map(|a| {
+            if let Attribute::LocalVariableTable(entries) = a { Some(entries) } else { None }
+        }));
+
+    if let Some(entries) = lvt {
+        let mut params: Vec<(u16, String)> = entries.iter()
+            .filter(|e| e.start_pc == 0)
+            .map(|e| (e.index, e.name.clone()))
+            .collect();
+        params.sort_by_key(|(slot, _)| *slot);
+        let skip = if has_this { 1 } else { 0 };
+        params.into_iter().skip(skip).map(|(_, name)| name).collect()
+    } else {
+        vec![]
+    }
+}
+
+// ── method body decompilation ─────────────────────────────────────────────
+
+/// Returns true if this constructor is the implicit default:
+/// - no parameters
+/// - body only contains `super()` + `return`  (≤ 5 instructions)
+/// - same accessibility as the class
+/// - class has exactly one constructor
+fn is_default_constructor(m: &Method, cf: &ClassFile) -> bool {
+    use crate::classfile::opcodes::opc;
+
+    // Must have no parameters (descriptor == "()V")
+    if m.descriptor != "()V" { return false; }
+
+    // Class must have exactly one constructor
+    let ctor_count = cf.methods.iter().filter(|x| x.is_constructor()).count();
+    if ctor_count != 1 { return false; }
+
+    // Must not declare checked exceptions
+    if m.attributes.iter().any(|a| matches!(a, Attribute::Exceptions(_))) { return false; }
+
+    // Body must be trivial: aload_0, invokespecial Object.<init>, return
+    if let Some(code) = m.code() {
+        let ops: Vec<u8> = code.instructions.iter().map(|i| i.opcode).collect();
+        // Typical pattern: [aload_0, invokespecial, return]
+        // or: [aload_0, invokespecial, return] with possible nop
+        let meaningful: Vec<u8> = ops.iter().copied().filter(|&o| o != opc::nop).collect();
+        if meaningful.len() > 3 { return false; }
+        // If body has any store/field operations, it's not trivial
+        let has_field_ops = ops.iter().any(|&o| matches!(o,
+            opc::putfield | opc::putstatic | opc::istore | opc::istore_0 |
+            opc::istore_1 | opc::istore_2 | opc::istore_3 | opc::astore |
+            opc::astore_0 | opc::astore_1 | opc::astore_2 | opc::astore_3 |
+            opc::lstore | opc::fstore | opc::dstore
+        ));
+        if has_field_ops { return false; }
+    }
+
+    true
+}
+
+fn decompile_method_body(m: &Method, code: &crate::classfile::attribute::CodeAttribute,
+                         cf: &ClassFile) -> String {
+    let cfg = cfg_builder::build(code);
+    let dom = DomTree::compute(&cfg);
+    let (arena, root) = recover(&cfg, &dom, code);
+    let is_void_or_ctor = m.is_constructor() || m.descriptor.ends_with(")V");
+    render_method_body(
+        &arena, root, code, &cf.constant_pool,
+        m.is_static(), &cf.this_class, 2,
+        is_void_or_ctor, cf,
+    )
+}
+
+/// Decompile a lambda implementation method body to a raw string (no lambda syntax).
+/// The bootstrap map builder will wrap this with `(params) -> `.
+fn decompile_lambda_body(m: &Method, code: &crate::classfile::attribute::CodeAttribute,
+                         cf: &ClassFile) -> String {
+    let cfg = cfg_builder::build(code);
+    let dom = DomTree::compute(&cfg);
+    let (arena, root) = recover(&cfg, &dom, code);
+    // Always suppress trailing return; lambda bodies are expressions or blocks
+    render_method_body(
+        &arena, root, code, &cf.constant_pool,
+        m.is_static(), &cf.this_class, 0,
+        true, cf,
+    )
+}

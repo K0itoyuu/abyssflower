@@ -1,0 +1,27 @@
+[package]
+name = "abyssflower"
+version = "0.1.0"
+edition = "2021"
+description = "A high-performance JVM bytecode decompiler written in Rust, with first-class Kotlin support"
+license = "Apache-2.0"
+keywords = ["decompiler", "jvm", "kotlin", "bytecode", "java"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "abyssflower"
+path = "src/main.rs"
+
+[lib]
+name = "abyssflower_lib"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror  = "1.0.69"
+bitflags   = "2.6.0"
+indexmap   = "2.7.0"
+
+[profile.release]
+opt-level    = 3
+lto          = "thin"
+codegen-units = 1
+strip        = true

@@ -1,0 +1,23 @@
+# Build artifacts
+/target/
+
+# Kotlin compiler (download for testing only)
+/kotlinc/
+/kotlin-compiler.zip
+
+# Reference decompiler source
+/vineflower-master/
+
+# Temporary output
+/artifacts/
+/bench/
+/examples/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
