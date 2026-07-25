@@ -143,6 +143,12 @@ fn render_stmt_stacked(
                                     then_expr: Box::new(then_val),
                                     else_expr: Box::new(else_val),
                                 };
+                                // Emit any side-effecting stmts from the outermost If's
+                                // cond block (e.g. `module = Instance;`) before the ternary.
+                                if let Stmt::If(s) = arena.get(child) {
+                                    let pre = cond_pre_stmts(&s.cond_insns, pool, is_static, this_class, names);
+                                    if !pre.is_empty() { emit_stmts(&pre, lvt, pool, cf, w); }
+                                }
                                 emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
                                 i += 2;
                                 stack = vec![];
@@ -150,15 +156,77 @@ fn render_stmt_stacked(
                             }
                         }
 
-                        // ── Value guard-chain fold ─────────────────────────────
+                        // ── No-else outer + full inner-if fold ────────────────
+                        // `if (A) { if (B) { return X; } else { return Y; } }` + `return Y`
+                        // The inner then-branch returns Y (same as the continuation);
+                        // the inner else-branch returns X (the interesting value).
+                        // → `return A && !B_cond ? X : Y`  (negate inner to get B's positive)
+                        // Handles javac's `A && B ? X : Y` compiled as two nested branches.
+                        if let Stmt::If(outer_s) = arena.get(child) {
+                            if outer_s.else_branch.is_none() {
+                                // Unwrap a single-child Seq if needed.
+                                let inner_id = {
+                                    let t = outer_s.then_branch;
+                                    match arena.get(t) {
+                                        Stmt::Seq(sq) => {
+                                            let ne: Vec<_> = sq.children.iter().copied()
+                                                .filter(|&c| !is_stmt_empty(arena, c, pool, is_static, this_class, names))
+                                                .collect();
+                                            if ne.len() == 1 { ne[0] } else { t }
+                                        }
+                                        _ => t,
+                                    }
+                                };
+                                if let Stmt::If(inner_s) = arena.get(inner_id) {
+                                    if let Some(inner_else_id) = inner_s.else_branch {
+                                        if let Some(cont_val) = extract_return_expr(
+                                            arena, next_id, vec![], pool, is_static, this_class, names)
+                                        {
+                                            // The inner then-branch either explicitly returns the
+                                            // same value as the continuation, or is Stmt::Exit
+                                            // (falls through to the continuation implicitly).
+                                            let inner_then_matches = match extract_return_expr(
+                                                arena, inner_s.then_branch, vec![], pool, is_static, this_class, names)
+                                            {
+                                                Some(v) => render_expr(&v) == render_expr(&cont_val),
+                                                None    => is_stmt_empty(arena, inner_s.then_branch, pool, is_static, this_class, names),
+                                            };
+                                            if inner_then_matches {
+                                                if let Some(inner_else_val) = extract_return_expr(
+                                                    arena, inner_else_id, vec![], pool, is_static, this_class, names)
+                                                {
+                                                    if render_expr(&inner_else_val) != render_expr(&cont_val) {
+                                                        // Emit cond pre-stmts for both outer and inner.
+                                                        let pre_o = cond_pre_stmts(&outer_s.cond_insns, pool, is_static, this_class, names);
+                                                        if !pre_o.is_empty() { emit_stmts(&pre_o, lvt, pool, cf, w); }
+                                                        let pre_i = cond_pre_stmts(&inner_s.cond_insns, pool, is_static, this_class, names);
+                                                        if !pre_i.is_empty() { emit_stmts(&pre_i, lvt, pool, cf, w); }
+                                                        // Build compound `A && B` condition.
+                                                        let outer_cond = condition_from_block_insns(
+                                                            &outer_s.cond_insns, pool, is_static, this_class, outer_s.negated, names);
+                                                        // Negate inner to get the "interesting" (else) path.
+                                                        let inner_cond = condition_from_block_insns(
+                                                            &inner_s.cond_insns, pool, is_static, this_class, !inner_s.negated, names);
+                                                        let compound = format!("{} && {}", outer_cond, inner_cond);
+                                                        let ternary = Expr::Ternary {
+                                                            cond: compound,
+                                                            then_expr: Box::new(inner_else_val),
+                                                            else_expr: Box::new(cont_val),
+                                                        };
+                                                        emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
+                                                        i += 2;
+                                                        stack = vec![];
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // `if (A) { [if (B) { ] push_X [}] }` + push_Y
                         // → stack value `A [&& B] ? X : Y` (consumed by next stmt)
-                        //
-                        // The outer If's cond_insns may push extra values BEFORE the
-                        // branch operand (e.g. `this` and `yRot+180f` for a later
-                        // setRotation call).  Compute cbs from those instructions and
-                        // prepend to the ternary result so the consumer block has a
-                        // complete initial_stack.
                         let else_residual = silent_eval(
                             arena, next_id, vec![], pool, is_static, this_class, names);
                         if else_residual.len() == 1 {
@@ -175,6 +243,9 @@ fn render_stmt_stacked(
                                 };
                                 // Prepend any pre-condition values pushed by the outer If.
                                 let mut new_stack = if let Stmt::If(s) = arena.get(child) {
+                                    // Emit side-effecting stmts from the cond block first.
+                                    let pre = cond_pre_stmts(&s.cond_insns, pool, is_static, this_class, names);
+                                    if !pre.is_empty() { emit_stmts(&pre, lvt, pool, cf, w); }
                                     cond_base_stack(
                                         &s.cond_insns, pool, stack.clone(),
                                         is_static, this_class, names)
@@ -898,6 +969,33 @@ fn is_stmt_empty(
         }
         _ => false,
     }
+}
+
+/// Simulate the instructions in a condition block BEFORE the branch and return
+/// any side-effecting statements (e.g. `module = ModuleXRay.INSTANCE;`).
+///
+/// These must be emitted as regular Java statements before the `if (cond) {`
+/// line; they are normally invisible because `condition_from_block_insns` only
+/// uses the operand stack and throws the emitted stmts away.
+fn cond_pre_stmts(
+    cond_insns:  &[crate::classfile::instruction::Instruction],
+    pool:        &ConstantPool,
+    is_static:   bool,
+    this_class:  &str,
+    names:       &[(u16, String)],
+) -> Vec<Expr> {
+    use crate::classfile::opcodes::opc;
+    let branch_idx = cond_insns.iter().rposition(|i| {
+        matches!(i.opcode,
+            opc::ifeq | opc::ifne | opc::iflt | opc::ifge | opc::ifgt | opc::ifle |
+            opc::if_icmpeq | opc::if_icmpne | opc::if_icmplt |
+            opc::if_icmpge | opc::if_icmpgt | opc::if_icmple |
+            opc::if_acmpeq | opc::if_acmpne | opc::ifnull | opc::ifnonnull
+        )
+    });
+    let Some(branch_idx) = branch_idx else { return vec![]; };
+    let result = simulate_block(&cond_insns[..branch_idx], pool, vec![], is_static, this_class, names);
+    result.stmts
 }
 
 fn render_if(
