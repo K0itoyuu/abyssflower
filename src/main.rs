@@ -7,9 +7,19 @@ use abyssflower_lib::ClassFile;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // MCP server mode
+    #[cfg(feature = "mcp")]
+    if args.iter().any(|a| a == "--mcp") {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(abyssflower_lib::mcp::run_mcp_server());
+        return;
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: abyssflower <file.class> [-o <output_dir>]");
         eprintln!("       abyssflower file1.class file2.class ...");
+        eprintln!("       abyssflower --mcp    (start MCP server over stdio)");
         process::exit(1);
     }
 

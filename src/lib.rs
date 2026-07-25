@@ -8,5 +8,8 @@ pub mod codegen;
 pub mod kotlin;
 pub mod ffi;
 
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 pub use classfile::ClassFile;
 pub use error::{DecompileError, Result};

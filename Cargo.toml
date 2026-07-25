@@ -22,6 +22,15 @@ thiserror  = "1.0.69"
 bitflags   = "2.6.0"
 indexmap   = "2.7.0"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
+rmcp       = { version = "3.0.0-beta", features = ["server", "transport-io", "schemars"], optional = true }
+schemars   = { version = "1", optional = true }
+serde      = { version = "1", features = ["derive"], optional = true }
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "io-std"], optional = true }
+base64     = { version = "0.22", optional = true }
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:serde", "dep:tokio", "dep:base64"]
 
 [profile.release]
 opt-level    = 3
