@@ -1381,21 +1381,45 @@ fn render_if(
     }
 
     if let Some(else_id) = s.else_branch {
-        w.line(&format!("if ({}) {{", cond_str));
-        w.indent();
-        render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
-        w.dedent();
-        w.line("} else {");
-        w.indent();
-        render_stmt(arena, else_id, code, pool, is_static, this_class, names, lvt, cf, w);
-        w.dedent();
-        w.line("}");
+        // Normalise: `if (c) { } else { body }` → `if (!c) { body }`
+        let then_is_empty = matches!(arena.get(s.then_branch), Stmt::Exit);
+        if then_is_empty {
+            let neg_cond = extract_branch_condition(
+                s.cond_block, code, pool, is_static, this_class, !s.negated, names);
+            w.line(&format!("if ({}) {{", neg_cond));
+            w.indent();
+            render_stmt(arena, else_id, code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+            return;
+        }
+        let else_is_empty = matches!(arena.get(else_id), Stmt::Exit);
+        if else_is_empty {
+            w.line(&format!("if ({}) {{", cond_str));
+            w.indent();
+            render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+        } else {
+            w.line(&format!("if ({}) {{", cond_str));
+            w.indent();
+            render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("} else {");
+            w.indent();
+            render_stmt(arena, else_id, code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+        }
     } else {
-        w.line(&format!("if ({}) {{", cond_str));
-        w.indent();
-        render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
-        w.dedent();
-        w.line("}");
+        let then_is_empty = matches!(arena.get(s.then_branch), Stmt::Exit);
+        if !then_is_empty {
+            w.line(&format!("if ({}) {{", cond_str));
+            w.indent();
+            render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+        }
     }
 }
 

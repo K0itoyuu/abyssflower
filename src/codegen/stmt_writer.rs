@@ -398,6 +398,39 @@ fn strip_string_valueof(expr: &Expr) -> String {
 
 // ── if/else ────────────────────────────────────────────────────────────────
 
+/// Returns true when rendering `id` would produce no visible output lines.
+/// Handles the common cases: Exit, an empty Block (zero instructions that
+/// produce no statements), and a Seq/If whose every child is empty.
+fn is_stmt_empty(
+    arena: &StmtArena,
+    id:    StmtId,
+    pool:  &ConstantPool,
+    is_static: bool,
+    this_class: &str,
+    names: &[(u16, String)],
+) -> bool {
+    match arena.get(id) {
+        Stmt::Exit => true,
+        Stmt::Block(b) => {
+            // A block with no instructions produces no visible output.
+            if b.instructions.is_empty() { return true; }
+            // A block that only pushes a value and has no side-effecting
+            // statements also produces no visible output.
+            let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
+            result.stmts.is_empty()
+        }
+        Stmt::Seq(s) => s.children.iter().all(|&c| is_stmt_empty(arena, c, pool, is_static, this_class, names)),
+        Stmt::If(s) => {
+            let then_empty = is_stmt_empty(arena, s.then_branch, pool, is_static, this_class, names);
+            let else_empty = s.else_branch
+                .map(|e| is_stmt_empty(arena, e, pool, is_static, this_class, names))
+                .unwrap_or(true);
+            then_empty && else_empty
+        }
+        _ => false,
+    }
+}
+
 fn render_if(
     arena: &StmtArena, s: IfStmt,
     _code: &CodeAttribute, pool: &ConstantPool,
@@ -406,16 +439,48 @@ fn render_if(
 ) {
     let cond_str = condition_from_block_insns(&s.cond_insns, pool, is_static, this_class, s.negated, names);
 
+    // Normalise: `if (c) { } else { body }` → `if (!c) { body }`
+    // Uses is_stmt_empty so structurally-non-Exit but semantically-empty blocks
+    // (e.g. a Block with zero instructions, or a nested If whose every arm is empty)
+    // are also treated as empty.
+    let then_is_empty = is_stmt_empty(arena, s.then_branch, pool, is_static, this_class, names);
+    if then_is_empty {
+        if let Some(else_id) = s.else_branch {
+            let else_also_empty = is_stmt_empty(arena, else_id, pool, is_static, this_class, names);
+            if else_also_empty { return; }  // both empty → emit nothing
+            let neg_cond = condition_from_block_insns(
+                &s.cond_insns, pool, is_static, this_class, !s.negated, names);
+            w.line(&format!("if ({}) {{", neg_cond));
+            w.indent();
+            render_stmt(arena, else_id, _code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+            return;
+        }
+        // then empty, no else — nothing to emit at all.
+        return;
+    }
+
     if let Some(else_id) = s.else_branch {
-        w.line(&format!("if ({}) {{", cond_str));
-        w.indent();
-        render_stmt(arena, s.then_branch, _code, pool, is_static, this_class, names, lvt, cf, w);
-        w.dedent();
-        w.line("} else {");
-        w.indent();
-        render_stmt(arena, else_id, _code, pool, is_static, this_class, names, lvt, cf, w);
-        w.dedent();
-        w.line("}");
+        // Suppress a trailing empty else clause too.
+        let else_is_empty = is_stmt_empty(arena, else_id, pool, is_static, this_class, names);
+        if else_is_empty {
+            w.line(&format!("if ({}) {{", cond_str));
+            w.indent();
+            render_stmt(arena, s.then_branch, _code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+        } else {
+            w.line(&format!("if ({}) {{", cond_str));
+            w.indent();
+            render_stmt(arena, s.then_branch, _code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("} else {");
+            w.indent();
+            render_stmt(arena, else_id, _code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+        }
     } else {
         w.line(&format!("if ({}) {{", cond_str));
         w.indent();
