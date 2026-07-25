@@ -589,6 +589,22 @@ fn try_extract_compound_return(
 
 /// If `id` is a block whose only effect is `return <expr>`, return that expr.
 /// Used to fold `if (c) { return A; } else { return B; }` → `return c ? A : B`.
+/// Replace `Const(Int(0))` / `Const(Int(1))` with proper boolean literals when
+/// the enclosing method is boolean-returning.
+fn coerce_bool_const(expr: Expr) -> Expr {
+    use crate::ir::expr::{ConstExpr, ConstValue};
+    use crate::types::java_type::JavaType;
+    if let Expr::Const(ref c) = expr {
+        if let ConstValue::Int(i) = c.value {
+            return Expr::Const(ConstExpr {
+                value: ConstValue::Int(i),
+                ty:    JavaType::BOOLEAN,
+            });
+        }
+    }
+    expr
+}
+
 fn extract_return_expr(
     arena:      &StmtArena,
     id:         StmtId,
@@ -602,7 +618,12 @@ fn extract_return_expr(
             let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
             if result.stmts.len() == 1 {
                 if let Expr::Return(Some(val)) = &result.stmts[0] {
-                    return Some(*val.clone());
+                    let mut expr = *val.clone();
+                    // In a boolean-returning method, iconst_0/1 means false/true.
+                    if crate::ir::stack_sim::current_return_is_boolean() {
+                        expr = coerce_bool_const(expr);
+                    }
+                    return Some(expr);
                 }
             }
             None
