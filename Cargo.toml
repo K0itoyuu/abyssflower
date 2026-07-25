@@ -1,6 +1,6 @@
 [package]
 name = "abyssflower"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A high-performance JVM bytecode decompiler written in Rust, with first-class Kotlin support"
 license = "Apache-2.0"

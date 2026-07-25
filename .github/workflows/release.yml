@@ -67,11 +67,32 @@ jobs:
         if: runner.os == 'Windows'
         run: mv target/${{ matrix.target }}/release/abyssflower.exe ${{ matrix.artifact }}
 
-      - name: Upload artifact
+      - name: Collect shared library (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          LIB=libabyssflower_lib.so
+          cp target/${{ matrix.target }}/release/$LIB ${LIB%.so}-${{ matrix.target }}.so
+
+      - name: Collect shared library (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          LIB=libabyssflower_lib.dylib
+          cp target/${{ matrix.target }}/release/$LIB ${LIB%.dylib}-${{ matrix.target }}.dylib
+
+      - name: Collect shared library (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/abyssflower_lib.dll abyssflower_lib-${{ matrix.target }}.dll
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            libabyssflower_lib-*.so
+            libabyssflower_lib-*.dylib
+            abyssflower_lib-*.dll
 
   release:
     needs: build

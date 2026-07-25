@@ -92,8 +92,7 @@ pub unsafe extern "C" fn abyssflower_free(ptr: *mut c_char) {
 /// The returned pointer is static and must NOT be freed.
 #[no_mangle]
 pub extern "C" fn abyssflower_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.0\0";
-    VERSION.as_ptr() as *const c_char
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
 /// Decompile a .class file by file path.
