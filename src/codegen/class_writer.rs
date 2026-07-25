@@ -1,7 +1,7 @@
 /// Class-level code generator.
 /// Renders a parsed ClassFile + its structured IR into a complete Java source file.
 use crate::cfg::{builder as cfg_builder, DomTree};
-use crate::classfile::attribute::{Attribute, BootstrapMethod};
+use crate::classfile::attribute::{Annotation, Attribute, BootstrapMethod, ElementValue};
 use crate::classfile::constant_pool::{CpEntry, ConstantPool};
 use crate::classfile::member::{flags, Field, Method};
 use crate::classfile::ClassFile;
@@ -14,6 +14,78 @@ use crate::types::signature::{
     parse_class_signature, parse_field_signature, parse_method_signature, GenericType,
 };
 use std::collections::{BTreeSet, HashMap};
+
+// ── Annotation rendering ──────────────────────────────────────────────────
+
+/// Render a single `ElementValue` to its Java source form.
+fn render_element_value(v: &ElementValue) -> String {
+    match v {
+        ElementValue::Byte(i)    => format!("(byte){}", i),
+        ElementValue::Char(i)    => format!("'{}'", char::from_u32(*i as u32).unwrap_or('?')),
+        ElementValue::Double(d)  => format!("{}d", d),
+        ElementValue::Float(f)   => format!("{}f", f),
+        ElementValue::Int(i)     => i.to_string(),
+        ElementValue::Long(l)    => format!("{}L", l),
+        ElementValue::Short(i)   => format!("(short){}", i),
+        ElementValue::Boolean(b) => b.to_string(),
+        ElementValue::String(s)  => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        ElementValue::ClassInfo(c) => {
+            let name = c.trim_start_matches('L').trim_end_matches(';');
+            format!("{}.class", name.replace('/', "."))
+        }
+        ElementValue::EnumConst { type_name, const_name } => {
+            let ty = type_name.trim_start_matches('L').trim_end_matches(';')
+                .replace('/', ".");
+            let simple = ty.rsplit('.').next().unwrap_or(&ty);
+            format!("{}.{}", simple, const_name)
+        }
+        ElementValue::Annotation(ann) => render_annotation(ann),
+        ElementValue::Array(elems) => {
+            if elems.len() == 1 {
+                render_element_value(&elems[0])
+            } else {
+                let inner: Vec<String> = elems.iter().map(render_element_value).collect();
+                format!("{{{}}}", inner.join(", "))
+            }
+        }
+    }
+}
+
+/// Render a full annotation, e.g. `@Mixin(Entity.class)` or
+/// `@Inject(method = "tick", at = @At("HEAD"))`.
+fn render_annotation(ann: &Annotation) -> String {
+    let name = ann.type_descriptor
+        .trim_start_matches('L')
+        .trim_end_matches(';')
+        .replace('/', ".");
+    // Use simple name for readability (imports handle the rest)
+    let simple = name.rsplit('.').next().unwrap_or(&name);
+    if ann.elements.is_empty() {
+        return format!("@{}", simple);
+    }
+    // If there is exactly one element named "value", omit the key.
+    if ann.elements.len() == 1 && ann.elements[0].0 == "value" {
+        return format!("@{}({})", simple, render_element_value(&ann.elements[0].1));
+    }
+    let pairs: Vec<String> = ann.elements.iter()
+        .map(|(k, v)| format!("{} = {}", k, render_element_value(v)))
+        .collect();
+    format!("@{}({})", simple, pairs.join(", "))
+}
+
+/// Write all annotations (both visible and invisible) for a slice of attributes.
+fn write_annotations(attrs: &[Attribute], w: &mut IndentWriter) {
+    for attr in attrs {
+        let anns: &[Annotation] = match attr {
+            Attribute::RuntimeVisibleAnnotations(a)   => a,
+            Attribute::RuntimeInvisibleAnnotations(a) => a,
+            _ => continue,
+        };
+        for ann in anns {
+            w.line(&render_annotation(ann));
+        }
+    }
+}
 
 // ── Lambda body cache ─────────────────────────────────────────────────────
 // Two thread-locals:
@@ -184,16 +256,7 @@ pub fn render_class(cf: &ClassFile) -> String {
     }
 
     // ── class-level annotations ────────────────────────────────────────
-    for attr in &cf.attributes {
-        if let Attribute::RuntimeVisibleAnnotations(anns) = attr {
-            for ann in anns {
-                let name = ann.type_descriptor
-                    .trim_start_matches('L')
-                    .trim_end_matches(';');
-                w.line(&format!("@{}", name.replace('/', ".")));
-            }
-        }
-    }
+    write_annotations(&cf.attributes, &mut w);
 
     // ── class declaration ──────────────────────────────────────────────
     let decl = build_class_declaration(cf);
@@ -354,6 +417,7 @@ fn should_skip_field(f: &Field) -> bool {
 }
 
 fn render_field(f: &Field, w: &mut IndentWriter) {
+    write_annotations(&f.attributes, w);
     let mut mods: Vec<&str> = Vec::new();
     if f.access_flags & flags::PUBLIC    != 0 { mods.push("public"); }
     if f.access_flags & flags::PROTECTED != 0 { mods.push("protected"); }
@@ -447,15 +511,7 @@ fn render_method(m: &Method, cf: &ClassFile, w: &mut IndentWriter) {
     if m.name.starts_with("lambda$") { return; }
 
     // ── method annotations ─────────────────────────────────────────────
-    for attr in &m.attributes {
-        if let Attribute::RuntimeVisibleAnnotations(anns) = attr {
-            for ann in anns {
-                let name = ann.type_descriptor
-                    .trim_start_matches('L').trim_end_matches(';');
-                w.line(&format!("@{}", name.replace('/', ".")));
-            }
-        }
-    }
+    write_annotations(&m.attributes, w);
 
     let decl = build_method_declaration(m, cf);
 

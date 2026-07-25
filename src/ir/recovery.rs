@@ -163,6 +163,9 @@ fn try_recover_loop(
     let last_opcode = header_block.last_insn().map(|i| i.opcode).unwrap_or(0);
     let is_conditional_at_header = is_conditional_branch(last_opcode);
 
+    // Snapshot header instructions before any mutation
+    let header_insns = header_block.instructions.clone();
+
     // Find blocks *inside* the loop in RPO order (excluding header)
     let body_blocks: Vec<BlockId> = ctx.cfg.rpo()
         .into_iter()
@@ -170,8 +173,8 @@ fn try_recover_loop(
         .collect();
 
     // Check tail block for do-while
-    let tail_block = ctx.cfg.block(lp.tail);
-    let tail_opcode = tail_block.last_insn().map(|i| i.opcode).unwrap_or(0);
+    let tail_insns = ctx.cfg.block(lp.tail).instructions.clone();
+    let tail_opcode = tail_insns.last().map(|i| i.opcode).unwrap_or(0);
     let is_conditional_at_tail = is_conditional_branch(tail_opcode);
 
     let kind = if is_conditional_at_header {
@@ -180,6 +183,15 @@ fn try_recover_loop(
         LoopKind::DoWhile
     } else {
         LoopKind::Infinite
+    };
+
+    // The instructions that contain the condition expression
+    let cond_insns = if kind == LoopKind::While {
+        header_insns.clone()
+    } else if kind == LoopKind::DoWhile {
+        tail_insns
+    } else {
+        vec![]
     };
 
     // Claim the header block to prevent re-processing
@@ -209,6 +221,7 @@ fn try_recover_loop(
         body_blocks,
         body: body_stmt,
         post_block,
+        cond_insns,
     };
 
     Some(ctx.arena.alloc(Stmt::Loop(loop_stmt)))
@@ -261,25 +274,33 @@ fn try_recover_if(
     let then_blocks: Vec<BlockId> = collect_path_blocks(ctx, fall_through, post, all_blocks);
     let else_blocks: Vec<BlockId> = collect_path_blocks(ctx, branch_target, post, all_blocks);
 
-    // Claim and structure
-    for &bid in &then_blocks { ctx.claim(bid); }
-    for &bid in &else_blocks { ctx.claim(bid); }
+    // Snapshot the condition block instructions before claiming anything.
+    let cond_insns = ctx.cfg.block(head).instructions.clone();
+
+    // Claim the head first so recursive calls don't re-enter it.
     ctx.claim(head);
 
+    // Recover branches — claim their blocks only AFTER recovery so recursive
+    // calls inside recover_region can still find and process them.
     let then_stmt = if then_blocks.is_empty() {
         ctx.arena.alloc(Stmt::Exit)
     } else {
-        recover_region(ctx, &then_blocks)
+        let s = recover_region(ctx, &then_blocks);
+        for &bid in &then_blocks { ctx.claim(bid); }
+        s
     };
 
     let else_stmt = if else_blocks.is_empty() {
         None
     } else {
-        Some(recover_region(ctx, &else_blocks))
+        let s = recover_region(ctx, &else_blocks);
+        for &bid in &else_blocks { ctx.claim(bid); }
+        Some(s)
     };
 
     let if_stmt = IfStmt {
         cond_block:  head,
+        cond_insns,
         then_branch: then_stmt,
         else_branch: else_stmt,
         negated:     false,

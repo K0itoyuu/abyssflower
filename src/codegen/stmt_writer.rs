@@ -4,7 +4,7 @@ use crate::classfile::constant_pool::{CpEntry, ConstantPool};
 use crate::classfile::ClassFile;
 use crate::codegen::expr_writer::{render_expr, simple_name, IndentWriter};
 use crate::ir::expr::{Expr, InvokeKind};
-use crate::ir::stack_sim::simulate_block;
+use crate::ir::stack_sim::{simulate_block, SlotInfo};
 use crate::ir::stmt::*;
 use crate::ir::StmtArena;
 
@@ -84,6 +84,102 @@ pub fn render_method_body(
 
 // ── stmt dispatch ─────────────────────────────────────────────────────────
 
+/// Render a statement, accepting an incoming stack (from a predecessor block)
+/// and returning any residual stack at the statement's exit.
+///
+/// Most statements consume the incoming stack and return an empty one.
+/// The exception is `Stmt::Block`: it runs the simulator with `initial_stack`
+/// and returns whatever is left on the stack after the block's instructions.
+/// This lets `Stmt::Seq` thread stack values between adjacent blocks — which
+/// is required for ternary/phi patterns like:
+///
+/// ```
+/// if (cond) { push A } else { push B }
+/// return top_of_stack;
+/// ```
+fn render_stmt_stacked(
+    arena:         &StmtArena,
+    id:            StmtId,
+    initial_stack: Vec<SlotInfo>,
+    code:          &CodeAttribute,
+    pool:          &ConstantPool,
+    is_static:     bool,
+    this_class:    &str,
+    names:         &[(u16, String)],
+    lvt:           &[LvtEntry],
+    cf:            &ClassFile,
+    w:             &mut IndentWriter,
+) -> Vec<SlotInfo> {
+    match arena.get(id) {
+        Stmt::Exit => vec![],
+
+        Stmt::Block(b) => {
+            let result = simulate_block(&b.instructions, pool, initial_stack, is_static, this_class, names);
+            emit_stmts(&result.stmts, lvt, w);
+            result.stack_out
+        }
+
+        Stmt::Seq(s) => {
+            let children = s.children.clone();
+            let mut stack = initial_stack;
+            for child in children {
+                // Pass the residual stack only to Block children; other
+                // control-flow nodes consume it.  Most blocks have an
+                // empty incoming stack anyway, so the overhead is tiny.
+                stack = render_stmt_stacked(
+                    arena, child, stack,
+                    code, pool, is_static, this_class, names, lvt, cf, w);
+            }
+            stack
+        }
+
+        Stmt::If(s) => {
+            // Ternary/phi detection: if both branches leave a non-empty residual
+            // stack (i.e. they are pure value-producers with no visible output),
+            // pass that residual to the next sibling in the Seq.
+            let then_residual = silent_eval(arena, s.then_branch, pool, is_static, this_class, names);
+            let else_residual = s.else_branch
+                .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
+                .unwrap_or_default();
+
+            render_if(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
+
+            // Return the then-branch residual if both branches agree they produce a value.
+            if !then_residual.is_empty() && !else_residual.is_empty() {
+                then_residual
+            } else {
+                vec![]
+            }
+        }
+
+        Stmt::Loop(s) => {
+            render_loop(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
+            vec![]
+        }
+
+        Stmt::Switch(s) => {
+            render_switch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
+            vec![]
+        }
+
+        Stmt::TryCatch(s) => {
+            render_try_catch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
+            vec![]
+        }
+
+        Stmt::Synchronized(s) => {
+            w.line("synchronized (/* monitor */) {");
+            w.indent();
+            let body = s.body;
+            render_stmt_stacked(arena, body, vec![], code, pool, is_static, this_class, names, lvt, cf, w);
+            w.dedent();
+            w.line("}");
+            vec![]
+        }
+    }
+}
+
+/// Convenience wrapper that discards the residual stack.
 fn render_stmt(
     arena:      &StmtArena,
     id:         StmtId,
@@ -96,45 +192,42 @@ fn render_stmt(
     cf:         &ClassFile,
     w:          &mut IndentWriter,
 ) {
-    match arena.get(id) {
-        Stmt::Exit => {}
+    render_stmt_stacked(arena, id, vec![], code, pool, is_static, this_class, names, lvt, cf, w);
+}
 
+/// Silently simulate a statement's effect on the stack WITHOUT emitting any
+/// source text.  Used for ternary/phi detection: if both branches of an `if`
+/// produce a non-empty residual stack (and write nothing visible), that value
+/// is threaded to the next sibling in the `Seq`.
+fn silent_eval(
+    arena:     &StmtArena,
+    id:        StmtId,
+    pool:      &ConstantPool,
+    is_static: bool,
+    this_class: &str,
+    names:     &[(u16, String)],
+) -> Vec<SlotInfo> {
+    match arena.get(id) {
+        Stmt::Exit => vec![],
         Stmt::Block(b) => {
             let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
-            emit_stmts(&result.stmts, lvt, w);
-        }
-
-        Stmt::Seq(s) => {
-            let children = s.children.clone();
-            for child in children {
-                render_stmt(arena, child, code, pool, is_static, this_class, names, lvt, cf, w);
+            // Only propagate if the block produced no visible statements
+            // (i.e. it only pushed a value — no assignments, calls, returns).
+            if result.stmts.is_empty() {
+                result.stack_out
+            } else {
+                vec![]
             }
         }
-
-        Stmt::If(s) => {
-            render_if(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
+        Stmt::Seq(s) => {
+            let mut stack = vec![];
+            for &child in &s.children {
+                let child_res = silent_eval(arena, child, pool, is_static, this_class, names);
+                if !child_res.is_empty() { stack = child_res; } else { stack = vec![]; }
+            }
+            stack
         }
-
-        Stmt::Loop(s) => {
-            render_loop(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
-        }
-
-        Stmt::Switch(s) => {
-            render_switch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
-        }
-
-        Stmt::TryCatch(s) => {
-            render_try_catch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
-        }
-
-        Stmt::Synchronized(s) => {
-            w.line("synchronized (/* monitor */) {");
-            w.indent();
-            let body = s.body;
-            render_stmt(arena, body, code, pool, is_static, this_class, names, lvt, cf, w);
-            w.dedent();
-            w.line("}");
-        }
+        _ => vec![],
     }
 }
 
@@ -241,35 +334,39 @@ fn strip_string_valueof(expr: &Expr) -> String {
 
 fn render_if(
     arena: &StmtArena, s: IfStmt,
-    code: &CodeAttribute, pool: &ConstantPool,
+    _code: &CodeAttribute, pool: &ConstantPool,
     is_static: bool, this_class: &str,
     names: &[(u16, String)], lvt: &[LvtEntry], cf: &ClassFile, w: &mut IndentWriter,
 ) {
-    let cond_str = extract_branch_condition(s.cond_block, code, pool, is_static, this_class, s.negated, names);
+    let cond_str = condition_from_block_insns(&s.cond_insns, pool, is_static, this_class, s.negated, names);
 
     if let Some(else_id) = s.else_branch {
         w.line(&format!("if ({}) {{", cond_str));
         w.indent();
-        render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
+        render_stmt(arena, s.then_branch, _code, pool, is_static, this_class, names, lvt, cf, w);
         w.dedent();
         w.line("} else {");
         w.indent();
-        render_stmt(arena, else_id, code, pool, is_static, this_class, names, lvt, cf, w);
+        render_stmt(arena, else_id, _code, pool, is_static, this_class, names, lvt, cf, w);
         w.dedent();
         w.line("}");
     } else {
         w.line(&format!("if ({}) {{", cond_str));
         w.indent();
-        render_stmt(arena, s.then_branch, code, pool, is_static, this_class, names, lvt, cf, w);
+        render_stmt(arena, s.then_branch, _code, pool, is_static, this_class, names, lvt, cf, w);
         w.dedent();
         w.line("}");
     }
 }
 
-/// Extract the condition expression string from the last conditional branch instruction.
-fn extract_branch_condition(
-    _block_id: crate::cfg::BlockId,
-    code: &CodeAttribute,
+/// Build a condition string from the instructions of a single basic block.
+///
+/// Finds the last conditional branch in `block_insns`, simulates everything
+/// before it, and formats the comparison expression.  Because we only look at
+/// the instructions belonging to the condition block (stored in `IfStmt /
+/// LoopStmt`), this is always accurate regardless of method size.
+fn condition_from_block_insns(
+    block_insns: &[crate::classfile::instruction::Instruction],
     pool: &ConstantPool,
     is_static: bool,
     this_class: &str,
@@ -278,20 +375,23 @@ fn extract_branch_condition(
 ) -> String {
     use crate::classfile::opcodes::opc;
 
-    let all_insns = &code.instructions;
-
-    // Find last conditional branch and simulate up to it.
-    let branch_idx = all_insns.iter().rposition(|i| {
+    // Find the branch instruction inside this block.
+    let branch_idx = block_insns.iter().rposition(|i| {
         matches!(i.opcode,
             opc::ifeq | opc::ifne | opc::iflt | opc::ifge | opc::ifgt | opc::ifle |
             opc::if_icmpeq | opc::if_icmpne | opc::if_icmplt |
             opc::if_icmpge | opc::if_icmpgt | opc::if_icmple |
             opc::if_acmpeq | opc::if_acmpne | opc::ifnull | opc::ifnonnull
         )
-    }).unwrap_or(0);
+    });
 
-    let branch_op = all_insns.get(branch_idx).map(|i| i.opcode).unwrap_or(opc::ifeq);
-    let sim_insns = &all_insns[..branch_idx];
+    let Some(branch_idx) = branch_idx else {
+        return "/* no branch */".into();
+    };
+
+    let branch_op = block_insns[branch_idx].opcode;
+    // Simulate only the instructions before the branch inside this block.
+    let sim_insns = &block_insns[..branch_idx];
     let result = simulate_block(sim_insns, pool, vec![], is_static, this_class, names);
 
     build_condition(branch_op, &result.stack_out, negated)
@@ -303,12 +403,30 @@ fn build_condition(
     negated: bool,
 ) -> String {
     use crate::classfile::opcodes::opc;
+    use crate::types::java_type::JavaType;
 
-    // Get top 1 or 2 stack values
-    let top  = stack.last().map(|s| render_expr(&s.expr)).unwrap_or_else(|| "/*?*/".into());
+    let top_slot = stack.last();
+    let top  = top_slot.map(|s| render_expr(&s.expr)).unwrap_or_else(|| "/*?*/".into());
+    let top_is_bool = top_slot.map(|s| s.ty == JavaType::BOOLEAN).unwrap_or(false);
     let sec  = if stack.len() >= 2 {
         render_expr(&stack[stack.len()-2].expr)
     } else { "0".into() };
+
+    // For boolean-typed values, ifeq/ifne can collapse to direct/negated form.
+    // ifeq  = "jump if equal to zero" = "jump if false" → condition is "true" when NOT taken (fall-through)
+    // ifne  = "jump if not equal to zero" = "jump if true" → condition is "true" when NOT taken (fall-through)
+    // In javac output: `if (b) goto T; else goto F;` compiles to `ifne T` (fall-through = false branch)
+    // The then-branch is the fall-through (succs[1]) in our convention.
+    // So: ifeq → then = false side  → condition string = top (not negated) for "if (top)"
+    //     ifne → then = true side   → condition string = top
+    // We just emit the raw expression and let the negated flag flip it.
+    if top_is_bool {
+        match branch_op {
+            opc::ifeq => return if negated { top } else { format!("!{}", top) },
+            opc::ifne => return if negated { format!("!{}", top) } else { top },
+            _ => {}
+        }
+    }
 
     let (lhs, rhs, op_str) = match branch_op {
         opc::ifeq     => (top, "0".into(),   if negated { "!=" } else { "==" }),
@@ -342,8 +460,8 @@ fn render_loop(
 ) {
     match s.kind {
         LoopKind::While => {
-            let cond = extract_branch_condition(
-                s.header_block, code, pool, is_static, this_class, false, names);
+            let cond = condition_from_block_insns(
+                &s.cond_insns, pool, is_static, this_class, false, names);
             w.line(&format!("while ({}) {{", cond));
             w.indent();
             render_stmt(arena, s.body, code, pool, is_static, this_class, names, lvt, cf, w);
@@ -355,8 +473,8 @@ fn render_loop(
             w.indent();
             render_stmt(arena, s.body, code, pool, is_static, this_class, names, lvt, cf, w);
             w.dedent();
-            let cond = extract_branch_condition(
-                s.tail_block, code, pool, is_static, this_class, false, names);
+            let cond = condition_from_block_insns(
+                &s.cond_insns, pool, is_static, this_class, false, names);
             w.line(&format!("}} while ({});", cond));
         }
         LoopKind::Infinite | LoopKind::For => {

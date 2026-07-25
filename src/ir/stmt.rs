@@ -101,6 +101,9 @@ pub struct SeqStmt {
 pub struct IfStmt {
     /// The block containing the conditional branch instruction.
     pub cond_block: BlockId,
+    /// The instructions of the condition block — stored here so the writer
+    /// doesn't have to search the entire method for the right branch.
+    pub cond_insns: Vec<Instruction>,
     /// True-branch body (`None` if the condition was negated and only the
     /// fall-through path exists).
     pub then_branch: StmtId,
@@ -127,6 +130,9 @@ pub struct LoopStmt {
     pub body:          StmtId,
     /// Block id immediately after the loop (the loop exit).
     pub post_block:    Option<BlockId>,
+    /// Instructions of the condition block (header for while, tail for do-while).
+    /// Stored here so the writer can simulate exactly the right instructions.
+    pub cond_insns:    Vec<Instruction>,
 }
 
 // ── SwitchStmt ───────────────────────────────────────────────────────────
