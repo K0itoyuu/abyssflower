@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A high-performance JVM bytecode decompiler written in Rust, with first-class Kotlin support"
 license = "Apache-2.0"
+repository = "https://github.com/K0itoyuu/abyssflower"
 keywords = ["decompiler", "jvm", "kotlin", "bytecode", "java"]
 categories = ["command-line-utilities", "development-tools"]
 
