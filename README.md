@@ -32,8 +32,12 @@ Abyssflower reads `.class` files and produces idiomatic Kotlin (or Java) source 
 
 ## Usage
 
+### CLI
+
 ```bash
 abyssflower <class-file>
+abyssflower file1.class file2.class ...
+abyssflower <class-file> -o <output-dir>
 ```
 
 ```bash
@@ -45,6 +49,109 @@ data class Person(val name: String, val age: Int) {
     fun greet(): String {
         return "Hello, ${this.name}!"
     }
+}
+```
+
+### MCP Server (AI Assistant Integration)
+
+Run as an [MCP](https://modelcontextprotocol.io) server over stdio, exposing decompilation tools to AI assistants like Claude:
+
+```bash
+abyssflower --mcp
+```
+
+**Claude Desktop configuration** (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "abyssflower": {
+      "command": "/path/to/abyssflower",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+**Exposed tools:**
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `decompile_file` | `path` | Decompile a .class file at the given path |
+| `decompile_jar_entry` | `jar_path`, `class_path` | Decompile a class entry from inside a JAR |
+| `decompile_bytes` | `bytes_base64` | Decompile from base64-encoded .class bytes |
+
+### Shared Library (DLL / SO / dylib)
+
+Build produces a shared library alongside the CLI binary:
+
+| Platform | File |
+|----------|------|
+| Windows | `abyssflower_lib.dll` |
+| Linux | `libabyssflower_lib.so` |
+| macOS | `libabyssflower_lib.dylib` |
+
+**C API:**
+
+```c
+// Decompile from raw bytes (auto-detects Kotlin/Java)
+char* abyssflower_decompile(const uint8_t* data, size_t len);
+
+// Decompile forcing Java output
+char* abyssflower_decompile_java(const uint8_t* data, size_t len);
+
+// Decompile a .class file by path
+char* abyssflower_decompile_file(const char* path);
+
+// Decompile a class entry from a JAR file
+char* abyssflower_decompile_jar_entry(const char* jar_path, const char* class_path);
+
+// Free a returned string (must call after using the result)
+void abyssflower_free(char* ptr);
+
+// Get version (static, do NOT free)
+const char* abyssflower_version();
+```
+
+**Python example:**
+
+```python
+import ctypes
+
+lib = ctypes.CDLL("abyssflower_lib.dll")  # or .so / .dylib
+lib.abyssflower_decompile_file.restype = ctypes.c_void_p
+lib.abyssflower_decompile_file.argtypes = [ctypes.c_char_p]
+lib.abyssflower_decompile_jar_entry.restype = ctypes.c_void_p
+lib.abyssflower_decompile_jar_entry.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+lib.abyssflower_free.argtypes = [ctypes.c_void_p]
+
+# Decompile a file
+ptr = lib.abyssflower_decompile_file(b"Person.class")
+print(ctypes.string_at(ptr).decode())
+lib.abyssflower_free(ptr)
+
+# Decompile from a JAR
+ptr = lib.abyssflower_decompile_jar_entry(b"app.jar", b"com/example/Main.class")
+print(ctypes.string_at(ptr).decode())
+lib.abyssflower_free(ptr)
+```
+
+**C/C++ example:**
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+extern char* abyssflower_decompile_file(const char* path);
+extern void abyssflower_free(char* ptr);
+
+int main() {
+    char* result = abyssflower_decompile_file("Person.class");
+    if (result) {
+        printf("%s\n", result);
+        abyssflower_free(result);
+    }
+    return 0;
 }
 ```
 
