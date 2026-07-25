@@ -34,6 +34,28 @@ impl IndentWriter {
 
 // ── Expression rendering ──────────────────────────────────────────────────
 
+/// If `expr` is an integer constant, return it as a Java boolean literal.
+/// `iconst_0` / `iconst_1` are how javac encodes `false` / `true`.
+fn int_const_as_bool(expr: &Expr) -> Option<&'static str> {
+    if let Expr::Const(c) = expr {
+        if let crate::ir::expr::ConstValue::Int(i) = c.value {
+            return Some(if i != 0 { "true" } else { "false" });
+        }
+    }
+    None
+}
+
+/// Render a value being stored into a location with the given field
+/// descriptor, mapping integer constants to `true`/`false` for `Z`.
+fn render_value_for_descriptor(value: &Expr, descriptor: &str) -> String {
+    if descriptor == "Z" {
+        if let Some(b) = int_const_as_bool(value) {
+            return b.to_string();
+        }
+    }
+    render_expr(value)
+}
+
 /// Render an expression to a String.
 pub fn render_expr(expr: &Expr) -> String {
     render_expr_prec(expr, 15) // 15 = lowest precedence
@@ -105,13 +127,14 @@ fn render_expr_inner(expr: &Expr) -> String {
             }
         }
 
-        Expr::Field { dir: FieldDir::Put, owner, name, object, value, .. } => {
+        Expr::Field { dir: FieldDir::Put, owner, name, object, value, descriptor } => {
             let lhs = match object {
                 Some(obj) => format!("{}.{}", render_expr_prec(obj, 0), name),
                 None      => format!("{}.{}", simple_name(owner), name),
             };
+            // A boolean field assigned from iconst_0/1 should read false/true.
             let rhs = value.as_ref()
-                .map(|v| render_expr(v))
+                .map(|v| render_value_for_descriptor(v, descriptor))
                 .unwrap_or_default();
             format!("{} = {}", lhs, rhs)
         }
@@ -227,10 +250,8 @@ fn render_expr_inner(expr: &Expr) -> String {
         Expr::Return(Some(val)) => {
             // In a boolean-returning method, `ireturn 0/1` means false/true.
             if crate::ir::stack_sim::current_return_is_boolean() {
-                if let Expr::Const(c) = val.as_ref() {
-                    if let crate::ir::expr::ConstValue::Int(i) = c.value {
-                        return format!("return {}", if i != 0 { "true" } else { "false" });
-                    }
+                if let Some(b) = int_const_as_bool(val) {
+                    return format!("return {}", b);
                 }
             }
             format!("return {}", render_expr(val))

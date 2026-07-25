@@ -735,6 +735,13 @@ fn decompile_method_body(m: &Method, code: &crate::classfile::attribute::CodeAtt
     // same names used in the signature so the body matches the declaration.
     let param_names = method_param_display_names(m);
     crate::ir::stack_sim::set_param_types_named(&m.descriptor, m.is_static(), &param_names);
+    // Also seed declared-local types from the LocalVariableTable, so e.g. a
+    // `boolean` local renders as `!flag` / `= false` rather than `== 0` / `= 0`.
+    let lvt_types: Vec<(u16, String, String)> = crate::codegen::stmt_writer::lvt_entries(code)
+        .into_iter()
+        .map(|e| (e.slot, e.name, e.descriptor))
+        .collect();
+    crate::ir::stack_sim::add_local_types(&lvt_types);
     let out = render_method_body(
         &arena, root, code, &cf.constant_pool,
         m.is_static(), &cf.this_class, 2,

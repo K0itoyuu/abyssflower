@@ -247,6 +247,21 @@ fn emit_stmts(stmts: &[Expr], lvt: &[LvtEntry], w: &mut IndentWriter) {
         let line = if let Expr::Assign { lhs, rhs } = expr {
             if let Expr::LocalVar(lv) = lhs.as_ref() {
                 let slot = lv.slot;
+                // A boolean local assigned from iconst_0/1 reads false/true.
+                let is_bool_slot = lvt.iter()
+                    .find(|e| e.slot == slot)
+                    .map(|e| e.descriptor == "Z")
+                    .unwrap_or(false);
+                let render_rhs = |r: &Expr| -> String {
+                    if is_bool_slot {
+                        if let Expr::Const(c) = r {
+                            if let crate::ir::expr::ConstValue::Int(i) = c.value {
+                                return if i != 0 { "true".into() } else { "false".into() };
+                            }
+                        }
+                    }
+                    render_expr_concat(r)
+                };
                 if !declared.contains(&slot) {
                     // Look up the LVT entry for this slot.
                     if let Some(entry) = lvt.iter().find(|e| e.slot == slot) {
@@ -254,14 +269,14 @@ fn emit_stmts(stmts: &[Expr], lvt: &[LvtEntry], w: &mut IndentWriter) {
                         let ty_str = type_str_from_descriptor(&entry.descriptor);
                         declared.insert(slot);
                         // Desugar invokedynamic concat in rhs.
-                        let rhs_str = render_expr_concat(rhs);
+                        let rhs_str = render_rhs(rhs);
                         format!("{} {} = {};", ty_str, entry.name, rhs_str)
                     } else {
-                        let rhs_str = render_expr_concat(rhs);
+                        let rhs_str = render_rhs(rhs);
                         format!("{} = {};", render_expr(lhs), rhs_str)
                     }
                 } else {
-                    let rhs_str = render_expr_concat(rhs);
+                    let rhs_str = render_rhs(rhs);
                     format!("{} = {};", render_expr(lhs), rhs_str)
                 }
             } else {

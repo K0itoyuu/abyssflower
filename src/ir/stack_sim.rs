@@ -175,6 +175,27 @@ pub fn set_param_types_named(descriptor: &str, is_static: bool, param_names: &[S
     RETURN_TYPE.with(|c| *c.borrow_mut() = ret);
 }
 
+/// Add local-variable types from the LocalVariableTable, so declared locals
+/// (not just parameters) recover their true primitive type.  Existing entries
+/// for the same slot are replaced.  Call after `set_param_types_named`.
+pub fn add_local_types(entries: &[(u16, String, String)]) {
+    PARAM_TYPES.with(|c| {
+        let mut v = c.borrow_mut();
+        for (slot, name, desc) in entries {
+            let ty = crate::types::descriptor::parse_field_descriptor(desc)
+                .map(|(t, _)| t)
+                .unwrap_or(JavaType::UNKNOWN);
+            if ty == JavaType::UNKNOWN { continue; }
+            if let Some(existing) = v.iter_mut().find(|(s, _, _)| s == slot) {
+                existing.1 = ty;
+                existing.2 = Some(name.clone());
+            } else {
+                v.push((*slot, ty, Some(name.clone())));
+            }
+        }
+    });
+}
+
 /// Clear the recorded parameter types (call after a method body is done).
 pub fn clear_param_types() {
     PARAM_TYPES.with(|c| c.borrow_mut().clear());
@@ -566,11 +587,27 @@ fn store_local(
     let val = stack.pop_expr();
     // Preserve the debug name from LVT if already set.
     let existing_name = locals.get_name(slot);
+    // `istore` is used for boolean/byte/short/char/int alike.  If we already
+    // know a narrower type for this slot (seeded from the LVT or the method
+    // descriptor), keep it rather than widening everything back to int.
+    let existing_ty = locals.get_ty(slot);
+    let ty = if ty == JavaType::INT && is_int_like(&existing_ty) {
+        existing_ty
+    } else {
+        ty
+    };
     locals.set(slot, ty.clone(), existing_name);
     let lv  = Expr::LocalVar(LocalVarExpr { slot, ty: ty.clone(), name: locals.get_name(slot) });
     let assign = Expr::Assign { lhs: Box::new(lv), rhs: Box::new(val.clone()) };
     stmts.push(assign);
     local_assignments.push((slot, val, ty));
+}
+
+/// True for the types that share the JVM's `int` computational type, so an
+/// `istore`/`iload` against such a slot should not clobber the narrower type.
+fn is_int_like(ty: &JavaType) -> bool {
+    *ty == JavaType::BOOLEAN || *ty == JavaType::BYTE
+        || *ty == JavaType::CHAR || *ty == JavaType::SHORT
 }
 
 fn binop(stack: &mut OperandStack, op: BinOp, ty: JavaType) {
