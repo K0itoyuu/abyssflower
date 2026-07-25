@@ -21,6 +21,7 @@ crate-type = ["rlib", "cdylib"]
 thiserror  = "1.0.69"
 bitflags   = "2.6.0"
 indexmap   = "2.7.0"
+zip        = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level    = 3

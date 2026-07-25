@@ -95,3 +95,107 @@ pub extern "C" fn abyssflower_version() -> *const c_char {
     static VERSION: &[u8] = b"0.1.0\0";
     VERSION.as_ptr() as *const c_char
 }
+
+/// Decompile a .class file by file path.
+///
+/// `path` must be a null-terminated UTF-8 string pointing to a .class file.
+/// Returns decompiled source or NULL on error. Free with `abyssflower_free`.
+///
+/// # Safety
+/// `path` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn abyssflower_decompile_file(path: *const c_char) -> *mut c_char {
+    if path.is_null() {
+        return ptr::null_mut();
+    }
+
+    let c_str = std::ffi::CStr::from_ptr(path);
+    let path_str = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let bytes = match std::fs::read(path_str) {
+        Ok(b) => b,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let cf = match ClassFile::parse(&bytes) {
+        Ok(cf) => cf,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let source = if is_kotlin_class(&cf) {
+        render_kotlin_class(&cf)
+    } else {
+        render_class(&cf)
+    };
+
+    match CString::new(source) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Decompile a .class entry from a JAR (zip) file.
+///
+/// `jar_path` — null-terminated path to the .jar file.
+/// `class_path` — null-terminated path of the .class entry inside the JAR
+///                (e.g. "com/example/Main.class").
+///
+/// Returns decompiled source or NULL on error. Free with `abyssflower_free`.
+///
+/// # Safety
+/// Both `jar_path` and `class_path` must be valid null-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn abyssflower_decompile_jar_entry(
+    jar_path: *const c_char,
+    class_path: *const c_char,
+) -> *mut c_char {
+    if jar_path.is_null() || class_path.is_null() {
+        return ptr::null_mut();
+    }
+
+    let jar_str = match std::ffi::CStr::from_ptr(jar_path).to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+    let class_str = match std::ffi::CStr::from_ptr(class_path).to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let bytes = match read_jar_entry(jar_str, class_str) {
+        Some(b) => b,
+        None => return ptr::null_mut(),
+    };
+
+    let cf = match ClassFile::parse(&bytes) {
+        Ok(cf) => cf,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let source = if is_kotlin_class(&cf) {
+        render_kotlin_class(&cf)
+    } else {
+        render_class(&cf)
+    };
+
+    match CString::new(source) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Read a single entry from a ZIP/JAR file.
+fn read_jar_entry(jar_path: &str, entry_path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(jar_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name(entry_path).ok()?;
+
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
