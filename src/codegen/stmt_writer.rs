@@ -730,8 +730,22 @@ fn try_extract_guard_chain(
 
         match arena.get(effective) {
             Stmt::If(s) => {
-                // Only follow no-else chains.
-                if s.else_branch.is_some() { return None; }
+                // Special leaf case: If(cond, then: Exit, else: return X)
+                // Recovery places the "interesting" value in the else branch when the
+                // then-branch falls through to the continuation.  Negate the condition
+                // to get the positive predicate and extract the else value.
+                if let Some(else_id) = s.else_branch {
+                    if is_stmt_empty(arena, s.then_branch, pool, is_static, this_class, names) {
+                        let val = extract_return_expr(arena, else_id, vec![], pool, is_static, this_class, names)?;
+                        // Negate: condition_from_block_insns with !negated gives the TAKEN path.
+                        let cond = condition_from_block_insns(
+                            &s.cond_insns, pool, is_static, this_class, !s.negated, names);
+                        conds.push(cond);
+                        if conds.is_empty() { return None; }
+                        return Some((conds, val));
+                    }
+                    return None; // else with non-empty then → can't fold
+                }
                 let cond = condition_from_block_insns(
                     &s.cond_insns, pool, is_static, this_class, s.negated, names);
                 conds.push(cond);
