@@ -15,6 +15,7 @@ path = "src/main.rs"
 [lib]
 name = "abyssflower_lib"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 thiserror  = "1.0.69"

@@ -6,6 +6,7 @@ pub mod cfg;
 pub mod ir;
 pub mod codegen;
 pub mod kotlin;
+pub mod ffi;
 
 pub use classfile::ClassFile;
 pub use error::{DecompileError, Result};
