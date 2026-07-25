@@ -125,6 +125,10 @@ fn collect_imports(cf: &ClassFile) -> BTreeSet<String> {
         if name.starts_with("java/lang/") && !name["java/lang/".len()..].contains('/') {
             continue;
         }
+        // Skip java.lang.invoke.* — these are implementation details of invokedynamic
+        // (StringConcatFactory, MethodHandles, LambdaMetafactory, etc.) that we desugar
+        // into readable Java source.  Importing them just creates noise.
+        if name.starts_with("java/lang/invoke/") { continue; }
         // Skip same-package types
         let pkg = name.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         if pkg == this_pkg { continue; }
