@@ -146,7 +146,12 @@ fn render_stmt_stacked(
 
             // Return the then-branch residual if both branches agree they produce a value.
             if !then_residual.is_empty() && !else_residual.is_empty() {
-                then_residual
+                // The base stack after the condition instruction is the pre-branch
+                // simulation output minus the operands consumed by the branch
+                // (1 for ifeq/ifne/…, 2 for if_icmp*/if_acmp*).
+                let mut base = cond_base_stack(&s.cond_insns, pool, initial_stack, is_static, this_class, names);
+                base.extend(then_residual);
+                base
             } else {
                 vec![]
             }
@@ -372,6 +377,43 @@ fn render_if(
         w.dedent();
         w.line("}");
     }
+}
+
+/// Simulate the condition block instructions up to (but not including) the
+/// branch, return the stack as it would be *after* the branch operands are
+/// consumed.  Used to recover the phi base when a ternary is embedded inside
+/// a larger expression (e.g. `arr[i] = (cond ? a : b)`).
+fn cond_base_stack(
+    block_insns: &[crate::classfile::instruction::Instruction],
+    pool: &ConstantPool,
+    initial_stack: Vec<crate::ir::stack_sim::SlotInfo>,
+    is_static: bool,
+    this_class: &str,
+    names: &[(u16, String)],
+) -> Vec<crate::ir::stack_sim::SlotInfo> {
+    use crate::classfile::opcodes::opc;
+    let branch_idx = block_insns.iter().rposition(|i| {
+        matches!(i.opcode,
+            opc::ifeq | opc::ifne | opc::iflt | opc::ifge | opc::ifgt | opc::ifle |
+            opc::if_icmpeq | opc::if_icmpne | opc::if_icmplt |
+            opc::if_icmpge | opc::if_icmpgt | opc::if_icmple |
+            opc::if_acmpeq | opc::if_acmpne | opc::ifnull | opc::ifnonnull
+        )
+    });
+    let Some(branch_idx) = branch_idx else { return initial_stack; };
+    let branch_op = block_insns[branch_idx].opcode;
+    let sim_insns = &block_insns[..branch_idx];
+    let mut out = simulate_block(sim_insns, pool, initial_stack, is_static, this_class, names).stack_out;
+    // The branch instruction pops 1 operand (ifeq/ifne/… and ifnull/ifnonnull)
+    // or 2 operands (if_icmp* and if_acmp*).
+    let pops: usize = match branch_op {
+        opc::if_icmpeq | opc::if_icmpne | opc::if_icmplt
+        | opc::if_icmpge | opc::if_icmpgt | opc::if_icmple
+        | opc::if_acmpeq | opc::if_acmpne => 2,
+        _ => 1,
+    };
+    for _ in 0..pops { out.pop(); }
+    out
 }
 
 /// Build a condition string from the instructions of a single basic block.

@@ -663,7 +663,7 @@ fn kt_render_expr_inner(expr: &Expr) -> String {
             format!("{}.size", kt_render_expr_prec(arr, 0))
         }
 
-        Expr::NewArray { kind, type_, dimensions } => {
+        Expr::NewArray { kind, type_, dimensions, initializer } => {
             let size = dimensions.first().map(|d| kt_render_expr(d)).unwrap_or_default();
             match kind {
                 NewKind::PrimitiveArray { atype } => {

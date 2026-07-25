@@ -64,6 +64,8 @@ impl OperandStack {
 
     fn peek(&self) -> Option<&SlotInfo> { self.slots.last() }
 
+    fn peek_mut(&mut self) -> Option<&mut SlotInfo> { self.slots.last_mut() }
+
     fn dup(&mut self) {
         if let Some(top) = self.slots.last().cloned() {
             self.slots.push(top);
@@ -370,6 +372,38 @@ fn step(
             let value = stack.pop_expr();
             let index = stack.pop_expr();
             let array = stack.pop_expr();
+
+            // Array-initializer / varargs idiom: javac emits
+            //   anewarray; (dup; iconst_<i>; <value>; aastore)*
+            // so at this point `array` is the duplicated NewArray and the
+            // original is still beneath us on the stack.  Accumulate the
+            // element into that allocation instead of emitting a standalone
+            // `arr[i] = v;` statement, which would reference a temporary that
+            // has no name in the source.
+            if matches!(array, Expr::NewArray { .. }) {
+                if let Some(top) = stack.peek_mut() {
+                    if let Expr::NewArray { initializer, .. } = &mut top.expr {
+                        let idx = const_int_value(&index);
+                        let elems = initializer.get_or_insert_with(Vec::new);
+                        match idx {
+                            // Place at the literal index, padding if javac
+                            // emitted them out of order.
+                            Some(i) if i >= 0 => {
+                                let i = i as usize;
+                                while elems.len() <= i {
+                                    elems.push(Expr::Const(ConstExpr {
+                                        value: ConstValue::Null, ty: JavaType::UNKNOWN,
+                                    }));
+                                }
+                                elems[i] = value;
+                            }
+                            _ => elems.push(value),
+                        }
+                        return;
+                    }
+                }
+            }
+
             stmts.push(Expr::ArrayStore {
                 array: Box::new(array),
                 index: Box::new(index),
@@ -478,6 +512,7 @@ fn step(
                     kind: NewKind::PrimitiveArray { atype },
                     type_: ty,
                     dimensions: vec![count],
+                    initializer: None,
                 }, JavaType::object("[primitive"));
             }
         }
@@ -490,6 +525,7 @@ fn step(
                     kind: NewKind::RefArray,
                     type_: ty,
                     dimensions: vec![count],
+                    initializer: None,
                 }, JavaType::object(&elem_name).array_of());
             }
         }
@@ -503,6 +539,7 @@ fn step(
                     kind: NewKind::MultiArray { dims: dimensions },
                     type_: JavaType::object(&class_name),
                     dimensions: dims,
+                    initializer: None,
                 }, JavaType::object(&class_name));
             }
         }
@@ -601,6 +638,14 @@ fn store_local(
     let assign = Expr::Assign { lhs: Box::new(lv), rhs: Box::new(val.clone()) };
     stmts.push(assign);
     local_assignments.push((slot, val, ty));
+}
+
+/// The integer value of a constant expression, if it is one.
+fn const_int_value(expr: &Expr) -> Option<i32> {
+    if let Expr::Const(c) = expr {
+        if let ConstValue::Int(i) = c.value { return Some(i); }
+    }
+    None
 }
 
 /// True for the types that share the JVM's `int` computational type, so an

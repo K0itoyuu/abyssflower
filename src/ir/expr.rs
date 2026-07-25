@@ -179,6 +179,12 @@ pub enum Expr {
         kind:       NewKind,
         type_:      JavaType,
         dimensions: Vec<Expr>,
+        /// Element values when the array is built with an inline initializer,
+        /// i.e. `new Foo[]{a, b, c}`.  javac compiles that (and every varargs
+        /// call site) to `anewarray` followed by a run of
+        /// `dup; iconst_<i>; <value>; aastore`, which the simulator folds back
+        /// into this field.  `None` means a plain sized allocation.
+        initializer: Option<Vec<Expr>>,
     },
 
     // ── object creation ───────────────────────────────────────────────

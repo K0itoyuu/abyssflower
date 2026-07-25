@@ -206,7 +206,12 @@ fn render_expr_inner(expr: &Expr) -> String {
             format!("{}.length", render_expr_prec(arr, 0))
         }
 
-        Expr::NewArray { kind, type_, dimensions } => {
+        Expr::NewArray { kind, type_, dimensions, initializer } => {
+            // `new Foo[]{a, b, c}` — the size is implied by the element list.
+            if let Some(elems) = initializer {
+                let inner: Vec<String> = elems.iter().map(render_expr).collect();
+                return format!("new {}[]{{{}}}", render_type(type_), inner.join(", "));
+            }
             let dims_str = dimensions.iter().map(render_expr).collect::<Vec<_>>();
             match kind {
                 NewKind::PrimitiveArray { .. } | NewKind::RefArray => {
