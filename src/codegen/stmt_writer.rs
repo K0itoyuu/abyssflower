@@ -93,7 +93,7 @@ pub fn render_method_body(
 /// This lets `Stmt::Seq` thread stack values between adjacent blocks — which
 /// is required for ternary/phi patterns like:
 ///
-/// ```
+/// ```text
 /// if (cond) { push A } else { push B }
 /// return top_of_stack;
 /// ```

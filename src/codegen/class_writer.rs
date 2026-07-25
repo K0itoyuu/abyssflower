@@ -665,6 +665,25 @@ fn extract_param_names_from_lvt(m: &Method, has_this: bool) -> Vec<String> {
     }
 }
 
+/// The display name for each parameter, in declaration order.
+/// Mirrors the resolution order used when rendering the method signature:
+/// LocalVariableTable → MethodParameters → `param<i>` placeholder.
+fn method_param_display_names(m: &Method) -> Vec<String> {
+    let md = MethodDescriptor::parse(&m.descriptor)
+        .unwrap_or_else(|_| MethodDescriptor { params: vec![], return_type: JavaType::VOID });
+    let lvt_names = extract_param_names_from_lvt(m, !m.is_static());
+    let mp_names: Vec<Option<String>> = m.attributes.iter()
+        .find_map(|a| if let Attribute::MethodParameters(ps) = a { Some(ps) } else { None })
+        .map(|ps| ps.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
+
+    (0..md.params.len()).map(|i| {
+        lvt_names.get(i).cloned()
+            .or_else(|| mp_names.get(i).and_then(|n| n.as_deref()).map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("param{}", i))
+    }).collect()
+}
+
 // ── method body decompilation ─────────────────────────────────────────────
 
 /// Returns true if this constructor is the implicit default:
@@ -711,11 +730,18 @@ fn decompile_method_body(m: &Method, code: &crate::classfile::attribute::CodeAtt
     let dom = DomTree::compute(&cfg);
     let (arena, root) = recover(&cfg, &dom, code);
     let is_void_or_ctor = m.is_constructor() || m.descriptor.ends_with(")V");
-    render_method_body(
+    // Seed parameter types so boolean/byte/short/char params keep their real
+    // type through the simulator (fixes `flag == 0` → `!flag`), and seed the
+    // same names used in the signature so the body matches the declaration.
+    let param_names = method_param_display_names(m);
+    crate::ir::stack_sim::set_param_types_named(&m.descriptor, m.is_static(), &param_names);
+    let out = render_method_body(
         &arena, root, code, &cf.constant_pool,
         m.is_static(), &cf.this_class, 2,
         is_void_or_ctor, cf,
-    )
+    );
+    crate::ir::stack_sim::clear_param_types();
+    out
 }
 
 /// Decompile a lambda implementation method body to a raw string (no lambda syntax).

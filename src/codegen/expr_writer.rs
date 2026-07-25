@@ -224,7 +224,17 @@ fn render_expr_inner(expr: &Expr) -> String {
 
         Expr::Throw(exc) => format!("throw {}", render_expr(exc)),
 
-        Expr::Return(Some(val)) => format!("return {}", render_expr(val)),
+        Expr::Return(Some(val)) => {
+            // In a boolean-returning method, `ireturn 0/1` means false/true.
+            if crate::ir::stack_sim::current_return_is_boolean() {
+                if let Expr::Const(c) = val.as_ref() {
+                    if let crate::ir::expr::ConstValue::Int(i) = c.value {
+                        return format!("return {}", if i != 0 { "true" } else { "false" });
+                    }
+                }
+            }
+            format!("return {}", render_expr(val))
+        }
         Expr::Return(None)      => "return".into(),
 
         Expr::Opaque { opcode, offset } =>

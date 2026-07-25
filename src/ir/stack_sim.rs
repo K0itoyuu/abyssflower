@@ -136,6 +136,63 @@ impl LocalVars {
     }
 }
 
+// ── Parameter type seeding ────────────────────────────────────────────────
+
+thread_local! {
+    /// `(slot, JavaType, Option<name>)` for the current method's parameters,
+    /// derived from its descriptor.  Seeded by `set_param_types` before a
+    /// method body is rendered.  Needed so `iload` of a
+    /// `boolean`/`byte`/`short`/`char` parameter recovers its true type
+    /// instead of defaulting to `int` — which in turn lets conditions render
+    /// as `!flag` rather than `flag == 0`.  The name keeps the body's
+    /// identifiers in sync with the rendered method signature.
+    static PARAM_TYPES: std::cell::RefCell<Vec<(u16, JavaType, Option<String>)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Record the parameter slot→type mapping for the method about to be simulated.
+/// Pass the method descriptor and whether the method is static.
+pub fn set_param_types(descriptor: &str, is_static: bool) {
+    set_param_types_named(descriptor, is_static, &[]);
+}
+
+/// Like `set_param_types`, but also records display names for each parameter
+/// (indexed by parameter position, not slot).  Pass the same names used to
+/// render the method signature so the body agrees with the declaration.
+pub fn set_param_types_named(descriptor: &str, is_static: bool, param_names: &[String]) {
+    let mut out: Vec<(u16, JavaType, Option<String>)> = Vec::new();
+    let mut ret: Option<JavaType> = None;
+    if let Ok(md) = crate::types::descriptor::MethodDescriptor::parse(descriptor) {
+        let mut slot: u16 = if is_static { 0 } else { 1 };
+        for (i, p) in md.params.iter().enumerate() {
+            out.push((slot, p.clone(), param_names.get(i).cloned()));
+            // long/double occupy two slots
+            slot += if *p == JavaType::LONG || *p == JavaType::DOUBLE { 2 } else { 1 };
+        }
+        ret = Some(md.return_type.clone());
+    }
+    PARAM_TYPES.with(|c| *c.borrow_mut() = out);
+    RETURN_TYPE.with(|c| *c.borrow_mut() = ret);
+}
+
+/// Clear the recorded parameter types (call after a method body is done).
+pub fn clear_param_types() {
+    PARAM_TYPES.with(|c| c.borrow_mut().clear());
+    RETURN_TYPE.with(|c| *c.borrow_mut() = None);
+}
+
+thread_local! {
+    /// Return type of the method currently being rendered.  Lets `ireturn 0`
+    /// render as `return false` in a `boolean` method instead of `return 0`.
+    static RETURN_TYPE: std::cell::RefCell<Option<JavaType>> =
+        std::cell::RefCell::new(None);
+}
+
+/// True when the method currently being rendered returns `boolean`.
+pub fn current_return_is_boolean() -> bool {
+    RETURN_TYPE.with(|c| c.borrow().as_ref() == Some(&JavaType::BOOLEAN))
+}
+
 // ── Public entry point ────────────────────────────────────────────────────
 
 /// Simulate a single basic block given an initial operand stack.
@@ -161,9 +218,17 @@ pub fn simulate_block(
     if !is_static {
         locals.set(0, JavaType::object(this_class), Some("this".into()));
     }
-    // Seed names from LocalVariableTable
+    // Seed parameter types from the method descriptor.  Do this BEFORE the
+    // LVT name pass so names (which carry UNKNOWN types) don't clobber them.
+    PARAM_TYPES.with(|c| {
+        for (slot, ty, name) in c.borrow().iter() {
+            locals.set(*slot, ty.clone(), name.clone());
+        }
+    });
+    // Seed names from LocalVariableTable, preserving any type already known.
     for (slot, name) in local_names {
-        locals.set(*slot, JavaType::UNKNOWN, Some(name.clone()));
+        let existing = locals.get_ty(*slot);
+        locals.set(*slot, existing, Some(name.clone()));
     }
 
     for insn in instructions {
@@ -218,6 +283,9 @@ fn step(
         ldc | ldc_w | ldc2_w => lift_ldc(insn, pool, stack),
 
         // ── loads ────────────────────────────────────────────────────
+        // `iload` covers boolean/byte/short/char/int at the bytecode level.
+        // push_local prefers the slot's known type (seeded from the method
+        // descriptor / LVT), falling back to int only when unknown.
         iload | iload_0 | iload_1 | iload_2 | iload_3 => {
             let slot = local_slot(op, insn, iload, iload_0);
             push_local(stack, locals, slot, JavaType::INT);
