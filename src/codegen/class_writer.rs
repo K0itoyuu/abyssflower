@@ -343,7 +343,7 @@ pub fn render_class(cf: &ClassFile) -> String {
             .collect();
         for f in extra_fields {
             w.line("");
-            render_field(f, &mut w);
+            render_field(f, cf, &mut w);
         }
     } else {
         // ── regular fields ─────────────────────────────────────────────
@@ -352,7 +352,7 @@ pub fn render_class(cf: &ClassFile) -> String {
             .collect();
         if !visible_fields.is_empty() { w.line(""); }
         for f in visible_fields {
-            render_field(f, &mut w);
+            render_field(f, cf, &mut w);
         }
     }
 
@@ -479,7 +479,7 @@ fn should_skip_field(f: &Field) -> bool {
     false
 }
 
-fn render_field(f: &Field, w: &mut IndentWriter) {
+fn render_field(f: &Field, cf: &ClassFile, w: &mut IndentWriter) {
     write_annotations(&f.attributes, w);
     let mut mods: Vec<&str> = Vec::new();
     if f.access_flags & flags::PUBLIC    != 0 { mods.push("public"); }
@@ -494,7 +494,7 @@ fn render_field(f: &Field, w: &mut IndentWriter) {
     let mods_str = mods.join(" ");
     let separator = if mods_str.is_empty() { "" } else { " " };
 
-    let const_val = field_constant_value(f);
+    let const_val = field_constant_value_with_pool(f, &cf.constant_pool);
     if let Some(val) = const_val {
         w.line(&format!("{}{}{} {} = {};", mods_str, separator, type_str, f.name, val));
     } else {
@@ -533,10 +533,66 @@ fn field_sig_matches_descriptor(sig_ty: &GenericType, descriptor: &str) -> bool 
 
 fn field_constant_value(f: &Field) -> Option<String> {
     for attr in &f.attributes {
-        if let Attribute::ConstantValue(_) = attr {
-            // The actual value resolution requires the constant pool;
-            // for now emit a placeholder that can be filled in later.
-            return Some("/* const */".into());
+        if let Attribute::ConstantValue(cv) = attr {
+            // Look up the value in the constant pool.  The index points to an
+            // Integer, Long, Float, Double, or String(Utf8) entry.
+            // We need the owning ClassFile's constant pool, but field rendering
+            // currently doesn't thread `cf` through here.  Work around by
+            // storing the index: the render_field caller has `cf` in scope.
+            // IMPLEMENTATION NOTE: this function is now a dead code path;
+            // `render_field` calls `field_constant_value_with_pool` instead.
+            let _ = cv;
+        }
+    }
+    None
+}
+
+/// Resolve a field's ConstantValue attribute using the class-level constant pool.
+fn field_constant_value_with_pool(f: &Field, pool: &ConstantPool) -> Option<String> {
+    for attr in &f.attributes {
+        if let Attribute::ConstantValue(cv) = attr {
+            match pool.get(cv.constant_value_index) {
+                Ok(CpEntry::Integer(v)) => {
+                    // Narrow int constants (boolean, byte, char, short) share
+                    // this entry.  Use the field descriptor to format correctly.
+                    let s = match f.descriptor.as_str() {
+                        "Z" => if *v != 0 { "true" } else { "false" }.to_string(),
+                        "C" => {
+                            let c = char::from_u32(*v as u32).unwrap_or('?');
+                            format!("'{}'", c.escape_default())
+                        }
+                        "B" | "S" => format!("{}", *v as i16),
+                        _ => format!("{}", v),
+                    };
+                    return Some(s);
+                }
+                Ok(CpEntry::Long(v))    => return Some(format!("{}L", v)),
+                Ok(CpEntry::Float(v))   => {
+                    if v.is_infinite() {
+                        return Some(if *v > 0.0 { "Float.POSITIVE_INFINITY".into() }
+                                    else { "Float.NEGATIVE_INFINITY".into() });
+                    }
+                    if v.is_nan() { return Some("Float.NaN".into()); }
+                    return Some(format!("{}f", v));
+                }
+                Ok(CpEntry::Double(v))  => {
+                    if v.is_infinite() {
+                        return Some(if *v > 0.0 { "Double.POSITIVE_INFINITY".into() }
+                                    else { "Double.NEGATIVE_INFINITY".into() });
+                    }
+                    if v.is_nan() { return Some("Double.NaN".into()); }
+                    return Some(format!("{}d", v));
+                }
+                Ok(CpEntry::String(s))  => {
+                    let escaped = s.replace('\\', "\\\\")
+                                   .replace('"', "\\\"")
+                                   .replace('\n', "\\n")
+                                   .replace('\r', "\\r")
+                                   .replace('\t', "\\t");
+                    return Some(format!("\"{}\"", escaped));
+                }
+                _ => return Some("/* const */".into()),
+            }
         }
     }
     None

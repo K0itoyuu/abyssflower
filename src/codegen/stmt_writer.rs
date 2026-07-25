@@ -461,22 +461,54 @@ fn build_condition(
 ) -> String {
     use crate::classfile::opcodes::opc;
     use crate::types::java_type::JavaType;
+    use crate::ir::expr::{BinOp, Expr};
 
     let top_slot = stack.last();
-    let top  = top_slot.map(|s| render_expr(&s.expr)).unwrap_or_else(|| "/*?*/".into());
     let top_is_bool = top_slot.map(|s| s.ty == JavaType::BOOLEAN).unwrap_or(false);
+
+    // ── lcmp / fcmpl / fcmpg / dcmpl / dcmpg ────────────────────────────────
+    // These push a 3-way int (-1/0/1) that is immediately consumed by ifeq/ifne/iflt/…
+    // Instead of rendering "a /*lcmp*/ b == 0", synthesize the correct operator.
+    //
+    // lcmp:  cmp(a,b) → then the branch opcode decides the relation
+    // fcmpg/dcmpg: NaN → +1 (so iflt/ifle on the result treats NaN as "not less")
+    // fcmpl/dcmpl: NaN → -1 (so ifgt/ifge on the result treats NaN as "not greater")
+    // For readability we ignore NaN semantics and emit the obvious operator.
+    if let Some(top_slot) = top_slot {
+        if let Expr::BinOp(cmp_op, lhs, rhs) = &top_slot.expr {
+            let is_cmp = matches!(cmp_op,
+                BinOp::LCmp | BinOp::FCmpL | BinOp::FCmpG | BinOp::DCmpL | BinOp::DCmpG
+            );
+            if is_cmp {
+                let lhs_s = render_expr(lhs);
+                let rhs_s = render_expr(rhs);
+                // The branch opcode is relative to the 3-way result:
+                //   ifeq  → == 0 → lhs == rhs
+                //   ifne  → != 0 → lhs != rhs
+                //   iflt  → < 0  → lhs <  rhs
+                //   ifle  → <= 0 → lhs <= rhs
+                //   ifgt  → > 0  → lhs >  rhs
+                //   ifge  → >= 0 → lhs >= rhs
+                let op_str = match branch_op {
+                    opc::ifeq => if negated { "!=" } else { "==" },
+                    opc::ifne => if negated { "==" } else { "!=" },
+                    opc::iflt => if negated { ">=" } else { "<"  },
+                    opc::ifle => if negated { ">"  } else { "<=" },
+                    opc::ifgt => if negated { "<=" } else { ">"  },
+                    opc::ifge => if negated { "<"  } else { ">=" },
+                    _         => if negated { "!=" } else { "==" },
+                };
+                return format!("{} {} {}", lhs_s, op_str, rhs_s);
+            }
+        }
+    }
+
+    let top  = top_slot.map(|s| render_expr(&s.expr)).unwrap_or_else(|| "/*?*/".into());
     let sec  = if stack.len() >= 2 {
         render_expr(&stack[stack.len()-2].expr)
     } else { "0".into() };
 
     // For boolean-typed values, ifeq/ifne can collapse to direct/negated form.
-    // ifeq  = "jump if equal to zero" = "jump if false" → condition is "true" when NOT taken (fall-through)
-    // ifne  = "jump if not equal to zero" = "jump if true" → condition is "true" when NOT taken (fall-through)
-    // In javac output: `if (b) goto T; else goto F;` compiles to `ifne T` (fall-through = false branch)
-    // The then-branch is the fall-through (succs[1]) in our convention.
-    // So: ifeq → then = false side  → condition string = top (not negated) for "if (top)"
-    //     ifne → then = true side   → condition string = top
-    // We just emit the raw expression and let the negated flag flip it.
     if top_is_bool {
         match branch_op {
             opc::ifeq => return if negated { top } else { format!("!{}", top) },
@@ -704,19 +736,85 @@ fn render_try_catch(
     render_stmt(arena, s.try_body, code, pool, is_static, this_class, names, lvt, cf, w);
     w.dedent();
     for clause in &s.catches {
-        let type_str = clause.catch_type.as_deref()
-            .map(|t| format!("{} e", simple_name(t)))
-            .unwrap_or_else(|| "Throwable e".into());
-        w.line(&format!("}} catch ({}) {{", type_str));
+        let ty  = clause.catch_type.as_deref().unwrap_or("java/lang/Throwable");
+        let var = catch_var_name(arena, clause.body, lvt).unwrap_or_else(|| "e".to_string());
+        w.line(&format!("}} catch ({} {}) {{", simple_name(ty), var));
         w.indent();
-        render_stmt(arena, clause.body, code, pool, is_static, this_class, names, lvt, cf, w);
+        // On entry to a handler the JVM clears the operand stack and pushes the
+        // thrown exception.  Seed that so the leading `astore` renders as the
+        // catch parameter binding rather than reading from an empty stack.
+        render_stmt_with_exception(arena, clause.body, ty, &var,
+                                   code, pool, is_static, this_class, names, lvt, cf, w);
         w.dedent();
     }
     if let Some(finally) = s.finally_body {
         w.line("} finally {");
         w.indent();
-        render_stmt(arena, finally, code, pool, is_static, this_class, names, lvt, cf, w);
+        render_stmt_with_exception(arena, finally, "java/lang/Throwable", "e",
+                                   code, pool, is_static, this_class, names, lvt, cf, w);
         w.dedent();
     }
     w.line("}");
+}
+
+/// Find the name the handler stores the exception into, from the LVT entry that
+/// matches the handler's leading `astore` slot.  Falls back to `None`.
+fn catch_var_name(arena: &StmtArena, body: StmtId, lvt: &[LvtEntry]) -> Option<String> {
+    use crate::classfile::opcodes::opc;
+    // Walk to the first Block in the handler body.
+    let mut id = body;
+    loop {
+        match arena.get(id) {
+            Stmt::Block(b) => {
+                let first = b.instructions.first()?;
+                if !matches!(first.opcode,
+                    opc::astore | opc::astore_0 | opc::astore_1 | opc::astore_2 | opc::astore_3)
+                { return None; }
+                let slot = match first.kind {
+                    crate::classfile::instruction::InsnKind::LocalVar { index } => index,
+                    _ => match first.opcode {
+                        opc::astore_0 => 0, opc::astore_1 => 1,
+                        opc::astore_2 => 2, opc::astore_3 => 3,
+                        _ => return None,
+                    },
+                };
+                return lvt.iter().find(|e| e.slot == slot).map(|e| e.name.clone());
+            }
+            Stmt::Seq(s) => { id = *s.children.first()?; }
+            _ => return None,
+        }
+    }
+}
+
+/// Render a handler body with the thrown exception pre-seeded on the operand
+/// stack, and suppress the redundant `<var> = <exception>` assignment that the
+/// leading `astore` would otherwise produce (the binding is already expressed
+/// by the `catch (T var)` clause).
+#[allow(clippy::too_many_arguments)]
+fn render_stmt_with_exception(
+    arena: &StmtArena, body: StmtId, exc_type: &str, var: &str,
+    code: &CodeAttribute, pool: &ConstantPool,
+    is_static: bool, this_class: &str,
+    names: &[(u16, String)], lvt: &[LvtEntry], cf: &ClassFile, w: &mut IndentWriter,
+) {
+    use crate::ir::stack_sim::SlotInfo;
+    use crate::ir::expr::{Expr, LocalVarExpr};
+    use crate::types::java_type::JavaType;
+
+    // Seed the stack with a LocalVar naming the catch parameter, so the
+    // handler's `astore <slot>` produces `var = var`, which we then drop.
+    let seed = vec![SlotInfo {
+        expr: Expr::LocalVar(LocalVarExpr {
+            slot: u16::MAX, ty: JavaType::object(exc_type), name: Some(var.to_string()),
+        }),
+        ty: JavaType::object(exc_type),
+    }];
+    let before = w.len();
+    render_stmt_stacked(arena, body, seed, code, pool, is_static, this_class, names, lvt, cf, w);
+    // Drop a leading self-assignment line like `IOException e = e;` / `e = e;`.
+    w.drop_line_if(before, |line| {
+        let t = line.trim();
+        t == format!("{} = {};", var, var)
+            || (t.ends_with(&format!("{} = {};", var, var)) && t.contains(' '))
+    });
 }

@@ -420,7 +420,9 @@ fn step(
                 }
             }
         }
-        pop2 => { stack.pop(); }
+        // pop2 removes one category-2 value (long/double) or two category-1 values.
+        // In both cases the net effect on stack depth is -2 slots.
+        pop2 => { stack.pop(); stack.pop(); }
         dup        => stack.dup(),
         dup_x1     => stack.dup_x1(),
         dup_x2     => stack.dup_x2(),
@@ -488,7 +490,13 @@ fn step(
 
         // ── field access ─────────────────────────────────────────────
         getstatic => lift_field(insn, pool, stack, FieldDir::Get, true),
-        putstatic => lift_field(insn, pool, stack, FieldDir::Put, true),
+        putstatic => {
+            // Same as putfield: lift_field pushes a Field{Put} node, then we pop
+            // and emit it as a side-effecting statement. Without the pop the node
+            // sits on the stack and gets consumed as an operand of the next instruction.
+            lift_field(insn, pool, stack, FieldDir::Put, true);
+            if let Some(e) = stack.pop() { stmts.push(e.expr); }
+        }
         getfield  => lift_field(insn, pool, stack, FieldDir::Get, false),
         putfield  => {
             lift_field(insn, pool, stack, FieldDir::Put, false);

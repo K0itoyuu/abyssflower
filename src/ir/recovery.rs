@@ -498,19 +498,20 @@ fn try_recover_try_catch(
     head: BlockId,
     all_blocks: &[BlockId],
 ) -> Option<StmtId> {
-    // Find the first exception range whose start_pc matches this block.
+    // Find ALL exception ranges whose start_pc matches this block.
     let head_block = ctx.cfg.block(head);
     let start_pc = head_block.start_offset;
 
-    let range = ctx.code.exception_table.iter()
-        .find(|r| r.start_pc as u32 == start_pc)?;
+    let ranges: Vec<_> = ctx.code.exception_table.iter()
+        .filter(|r| r.start_pc as u32 == start_pc)
+        .collect();
 
-    let handler_id = ctx.cfg.real_blocks()
-        .find(|b| b.start_offset == range.handler_pc as u32)
-        .map(|b| b.id)?;
+    if ranges.is_empty() { return None; }
+
+    // Use the first range to establish the protected region extent.
+    let end_pc = ranges[0].end_pc as u32;
 
     // Collect all blocks in the protected range [start_pc, end_pc)
-    let end_pc = range.end_pc as u32;
     let try_blocks: Vec<BlockId> = all_blocks.iter().copied()
         .filter(|&bid| {
             let b = ctx.cfg.block(bid);
@@ -520,28 +521,105 @@ fn try_recover_try_catch(
 
     if try_blocks.is_empty() { return None; }
 
-    // Claim try blocks and handler
-    for &b in &try_blocks { ctx.claim(b); }
-    ctx.claim(handler_id);
-
-    let try_body = recover_region(ctx, &try_blocks);
-
-    // Handler body: blocks starting at handler_pc
-    let handler_blocks: Vec<BlockId> = all_blocks.iter().copied()
-        .filter(|&bid| {
-            let b = ctx.cfg.block(bid);
-            b.start_offset >= range.handler_pc as u32
-                && !try_blocks.contains(&bid)
-        })
-        .take_while(|&bid| !ctx.is_claimed(bid))
+    // Collect all handler start PCs for bounding each handler's block range.
+    let handler_pcs: Vec<u32> = ranges.iter()
+        .map(|r| r.handler_pc as u32)
         .collect();
-    let handler_body = recover_region(ctx, &handler_blocks);
-    for &b in &handler_blocks { ctx.claim(b); }
 
-    let catch_type = range.catch_type.clone();
-    let catches = vec![CatchClause { catch_type, body: handler_body }];
+    // Claim head FIRST to stop infinite recursion: recover_region would see head,
+    // call try_recover_try_catch again, and loop.  With head already claimed,
+    // recover_region processes it as a plain Stmt::Block (the fallback path).
+    ctx.claim(head);
 
-    let tc = TryCatchStmt { try_body, catches, finally_body: None };
+    // Build the try body: head block (plain) + the inner try blocks.
+    let head_block = ctx.cfg.block(head);
+    let head_stmt = ctx.arena.alloc(Stmt::Block(BlockStmt {
+        block_id:     head,
+        instructions: head_block.instructions.clone(),
+        succs:        head_block.succs.clone(),
+    }));
+
+    let inner_try_blocks: Vec<BlockId> = try_blocks.iter().copied()
+        .filter(|&b| b != head)
+        .collect();
+    for &b in &inner_try_blocks { ctx.claim(b); }
+    let inner_body = recover_region(ctx, &inner_try_blocks);
+
+    let try_body = if matches!(ctx.arena.get(inner_body), Stmt::Exit) {
+        head_stmt
+    } else {
+        let seq = ctx.arena.alloc(Stmt::Seq(SeqStmt { children: vec![head_stmt, inner_body] }));
+        seq
+    };
+
+    // Build one CatchClause per exception handler, in declaration order.
+    let mut catches: Vec<CatchClause> = Vec::new();
+    let mut finally_body: Option<StmtId> = None;
+
+    for (idx, range) in ranges.iter().enumerate() {
+        let handler_pc = range.handler_pc as u32;
+
+        // Find the handler start block
+        let handler_id = match ctx.cfg.real_blocks()
+            .find(|b| b.start_offset == handler_pc)
+            .map(|b| b.id)
+        {
+            Some(id) => id,
+            None => continue,
+        };
+
+        // Skip if already claimed (shared handler between multiple ranges)
+        if ctx.is_claimed(handler_id) { continue; }
+
+        // Next handler's start PC (or u32::MAX) — use as upper bound so we
+        // don't accidentally grab blocks from a sibling handler.
+        let next_handler_pc = handler_pcs.get(idx + 1).copied().unwrap_or(u32::MAX);
+
+        // Collect the handler's blocks BEFORE claiming anything, otherwise
+        // take_while(!claimed) stops immediately and the body comes back empty.
+        let handler_blocks: Vec<BlockId> = all_blocks.iter().copied()
+            .filter(|&bid| {
+                let b = ctx.cfg.block(bid);
+                b.start_offset >= handler_pc
+                    && b.start_offset < next_handler_pc
+                    && !try_blocks.contains(&bid)
+            })
+            .take_while(|&bid| !ctx.is_claimed(bid))
+            .collect();
+
+        // Claim the header up front so recover_region on the remaining blocks
+        // cannot re-enter this handler, then emit the header as a plain Block
+        // and sequence the rest after it.
+        ctx.claim(handler_id);
+        let hb = ctx.cfg.block(handler_id);
+        let header_stmt = ctx.arena.alloc(Stmt::Block(BlockStmt {
+            block_id:     handler_id,
+            instructions: hb.instructions.clone(),
+            succs:        hb.succs.clone(),
+        }));
+
+        let rest: Vec<BlockId> = handler_blocks.iter().copied()
+            .filter(|&b| b != handler_id)
+            .collect();
+        for &b in &rest { ctx.claim(b); }
+        let rest_body = recover_region(ctx, &rest);
+
+        let handler_body = if matches!(ctx.arena.get(rest_body), Stmt::Exit) {
+            header_stmt
+        } else {
+            ctx.arena.alloc(Stmt::Seq(SeqStmt { children: vec![header_stmt, rest_body] }))
+        };
+
+        if range.catch_type.is_none() {
+            finally_body = Some(handler_body);
+        } else {
+            catches.push(CatchClause { catch_type: range.catch_type.clone(), body: handler_body });
+        }
+    }
+
+    if catches.is_empty() && finally_body.is_none() { return None; }
+
+    let tc = TryCatchStmt { try_body, catches, finally_body };
     Some(ctx.arena.alloc(Stmt::TryCatch(tc)))
 }
 

@@ -29,6 +29,25 @@ impl IndentWriter {
 
     pub fn push_str(&mut self, s: &str) { self.buf.push_str(s); }
 
+    /// Current length of the emitted buffer — use with `drop_line_if` to
+    /// retroactively remove a line emitted after this point.
+    pub fn len(&self) -> usize { self.buf.len() }
+
+    pub fn is_empty(&self) -> bool { self.buf.is_empty() }
+
+    /// If the first line emitted after byte offset `from` satisfies `pred`,
+    /// remove that line from the buffer.  Used to suppress redundant
+    /// synthesised assignments (e.g. a catch parameter's self-assignment).
+    pub fn drop_line_if<F: Fn(&str) -> bool>(&mut self, from: usize, pred: F) {
+        if from >= self.buf.len() { return; }
+        let tail = &self.buf[from..];
+        let Some(nl) = tail.find('\n') else { return };
+        let first = &tail[..nl];
+        if pred(first) {
+            self.buf.replace_range(from..from + nl + 1, "");
+        }
+    }
+
     pub fn finish(self) -> String { self.buf }
 }
 
