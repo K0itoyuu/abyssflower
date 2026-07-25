@@ -134,9 +134,27 @@ fn render_stmt_stacked(
         }
 
         Stmt::If(s) => {
-            // Ternary/phi detection: if both branches leave a non-empty residual
-            // stack (i.e. they are pure value-producers with no visible output),
-            // pass that residual to the next sibling in the Seq.
+            // ── Return-ternary fold ────────────────────────────────────────
+            // `if (c) { return A; } else { return B; }` → `return c ? A : B;`
+            // This must run before silent_eval so we don't discard the arms.
+            if let Some(else_id) = s.else_branch {
+                if let (Some(then_ret), Some(else_ret)) = (
+                    extract_return_expr(arena, s.then_branch, pool, is_static, this_class, names),
+                    extract_return_expr(arena, else_id,        pool, is_static, this_class, names),
+                ) {
+                    let cond = condition_from_block_insns(
+                        &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                    let ternary = Expr::Ternary {
+                        cond,
+                        then_expr: Box::new(then_ret),
+                        else_expr: Box::new(else_ret),
+                    };
+                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                    return vec![];
+                }
+            }
+
+            // ── Value-ternary fold ─────────────────────────────────────────
             let then_residual = silent_eval(arena, s.then_branch, pool, is_static, this_class, names);
             let else_residual = s.else_branch
                 .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
@@ -401,6 +419,43 @@ fn strip_string_valueof(expr: &Expr) -> String {
 /// Returns true when rendering `id` would produce no visible output lines.
 /// Handles the common cases: Exit, an empty Block (zero instructions that
 /// produce no statements), and a Seq/If whose every child is empty.
+/// If `id` is a block whose only effect is `return <expr>`, return that expr.
+/// Used to fold `if (c) { return A; } else { return B; }` → `return c ? A : B`.
+fn extract_return_expr(
+    arena:      &StmtArena,
+    id:         StmtId,
+    pool:       &ConstantPool,
+    is_static:  bool,
+    this_class: &str,
+    names:      &[(u16, String)],
+) -> Option<Expr> {
+    match arena.get(id) {
+        Stmt::Block(b) => {
+            let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
+            if result.stmts.len() == 1 {
+                if let Expr::Return(Some(val)) = &result.stmts[0] {
+                    return Some(*val.clone());
+                }
+            }
+            None
+        }
+        Stmt::Seq(s) => {
+            // A Seq is eligible if it contains exactly one child that is
+            // a return-only Block (the rest are empty).
+            let mut ret_expr = None;
+            for &child in &s.children {
+                match extract_return_expr(arena, child, pool, is_static, this_class, names) {
+                    Some(e) if ret_expr.is_none() => ret_expr = Some(e),
+                    None if is_stmt_empty(arena, child, pool, is_static, this_class, names) => {}
+                    _ => return None, // multiple returns or non-empty non-return content
+                }
+            }
+            ret_expr
+        }
+        _ => None,
+    }
+}
+
 fn is_stmt_empty(
     arena: &StmtArena,
     id:    StmtId,
