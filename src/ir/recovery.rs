@@ -177,9 +177,17 @@ fn try_recover_loop(
     let tail_opcode = tail_insns.last().map(|i| i.opcode).unwrap_or(0);
     let is_conditional_at_tail = is_conditional_branch(tail_opcode);
 
-    let kind = if is_conditional_at_header {
+    // A conditional branch at the header is only a `while` test if the *taken*
+    // path (succs[0] = branch target) leaves the loop.  When the taken path is
+    // a back-edge that stays inside the loop (e.g. `ifgt self` in a single-block
+    // do-while) the condition keeps the loop running, so negation is not needed.
+    let header_taken_exits = header_block.succs.first()
+        .map(|s| !lp.body.contains(s))
+        .unwrap_or(false);
+
+    let kind = if is_conditional_at_header && header_taken_exits {
         LoopKind::While
-    } else if is_conditional_at_tail {
+    } else if is_conditional_at_tail || is_conditional_at_header {
         LoopKind::DoWhile
     } else {
         LoopKind::Infinite
@@ -204,16 +212,33 @@ fn try_recover_loop(
     let inner_blocks: Vec<BlockId> = if kind == LoopKind::While {
         body_blocks.iter().copied().filter(|&id| id != header).collect()
     } else {
-        body_blocks.clone()
+        body_blocks.iter().copied().filter(|&id| id != header).collect()
     };
 
-    let body_stmt = recover_region(ctx, &inner_blocks);
+    let body_stmt = if kind == LoopKind::DoWhile && inner_blocks.is_empty() {
+        // Single-block do-while: the header contains both the body instructions
+        // and the trailing conditional branch (the back-edge test).  The body is
+        // everything up to (but not including) the conditional branch.
+        let body_insns: Vec<_> = header_insns.iter()
+            .take_while(|i| !is_conditional_branch(i.opcode))
+            .cloned()
+            .collect();
+        let hb = ctx.cfg.block(header);
+        ctx.arena.alloc(Stmt::Block(BlockStmt {
+            block_id:     header,
+            instructions: body_insns,
+            succs:        hb.succs.clone(),
+        }))
+    } else {
+        recover_region(ctx, &inner_blocks)
+    };
 
     // Claim any remaining unclaimed body blocks
     for &bid in &body_blocks {
         ctx.claim(bid);
     }
 
+    let cond_negated = kind == LoopKind::While;
     let loop_stmt = LoopStmt {
         kind,
         header_block: header,
@@ -222,6 +247,9 @@ fn try_recover_loop(
         body: body_stmt,
         post_block,
         cond_insns,
+        // Only a `while` header branch jumps out of the loop, so only there is
+        // the printed condition the negation of the branch predicate.
+        cond_negated,
     };
 
     Some(ctx.arena.alloc(Stmt::Loop(loop_stmt)))
@@ -303,7 +331,11 @@ fn try_recover_if(
         cond_insns,
         then_branch: then_stmt,
         else_branch: else_stmt,
-        negated:     false,
+        // `then_branch` is the fall-through path, which runs when the branch is
+        // NOT taken.  The printed condition must therefore be the negation of
+        // the branch opcode's predicate: `ifle L` means the fall-through runs
+        // when `x > 0`, so we print `if (x > 0)`.
+        negated:     true,
         post_block:  post,
     };
 

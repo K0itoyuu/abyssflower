@@ -132,6 +132,15 @@ fn render_expr_inner(expr: &Expr) -> String {
             }
         }
 
+        Expr::Ternary { cond, then_expr, else_expr } => {
+            // `?:` is right-associative: the false arm may nest another
+            // ternary without parentheses, the true arm may not.
+            format!("{} ? {} : {}",
+                cond,
+                render_expr_prec(then_expr, 12),
+                render_expr_prec(else_expr, 13))
+        }
+
         Expr::InstanceOf(obj, ty) => {
             format!("{} instanceof {}",
                 render_expr_prec(obj, 6),

@@ -142,6 +142,31 @@ fn render_stmt_stacked(
                 .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
                 .unwrap_or_default();
 
+            // Both arms are pure single-value producers → fold into `c ? a : b`
+            // and emit nothing at all.  Rendering the if/else shell here as well
+            // would leave an empty `if {} else {}` in front of the consumer.
+            if then_residual.len() == 1 && else_residual.len() == 1 {
+                let cond = condition_from_block_insns(
+                    &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                let then_slot = then_residual.into_iter().next().unwrap();
+                let else_slot = else_residual.into_iter().next().unwrap();
+                // `then_branch` is the fall-through path, which is where control
+                // lands when the branch is NOT taken — and `cond` is rendered as
+                // the not-taken predicate, so the arms line up directly.
+                let ty = if then_slot.ty == crate::types::java_type::JavaType::VOID {
+                             else_slot.ty.clone() }
+                         else { then_slot.ty.clone() };
+                let ternary = Expr::Ternary {
+                    cond,
+                    then_expr: Box::new(then_slot.expr),
+                    else_expr: Box::new(else_slot.expr),
+                };
+                let mut base = cond_base_stack(
+                    &s.cond_insns, pool, initial_stack, is_static, this_class, names);
+                base.push(SlotInfo { expr: ternary, ty });
+                return base;
+            }
+
             render_if(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
 
             // Return the then-branch residual if both branches agree they produce a value.
@@ -231,6 +256,27 @@ fn silent_eval(
                 if !child_res.is_empty() { stack = child_res; } else { stack = vec![]; }
             }
             stack
+        }
+        Stmt::If(s) => {
+            // Recurse so nested ternaries like `a > b ? a : (b > 0 ? b : 0)`
+            // propagate a value through the outer else-arm's If as well.
+            let then_r = silent_eval(arena, s.then_branch, pool, is_static, this_class, names);
+            let else_r = s.else_branch
+                .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
+                .unwrap_or_default();
+            if then_r.len() == 1 && else_r.len() == 1 {
+                let cond = condition_from_block_insns(
+                    &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                let ty = then_r[0].ty.clone();
+                let ternary = crate::ir::expr::Expr::Ternary {
+                    cond,
+                    then_expr: Box::new(then_r.into_iter().next().unwrap().expr),
+                    else_expr: Box::new(else_r.into_iter().next().unwrap().expr),
+                };
+                vec![SlotInfo { expr: ternary, ty }]
+            } else {
+                vec![]
+            }
         }
         _ => vec![],
     }
@@ -550,7 +596,7 @@ fn render_loop(
     match s.kind {
         LoopKind::While => {
             let cond = condition_from_block_insns(
-                &s.cond_insns, pool, is_static, this_class, false, names);
+                &s.cond_insns, pool, is_static, this_class, s.cond_negated, names);
             w.line(&format!("while ({}) {{", cond));
             w.indent();
             render_stmt(arena, s.body, code, pool, is_static, this_class, names, lvt, cf, w);
@@ -563,7 +609,7 @@ fn render_loop(
             render_stmt(arena, s.body, code, pool, is_static, this_class, names, lvt, cf, w);
             w.dedent();
             let cond = condition_from_block_insns(
-                &s.cond_insns, pool, is_static, this_class, false, names);
+                &s.cond_insns, pool, is_static, this_class, s.cond_negated, names);
             w.line(&format!("}} while ({});", cond));
         }
         LoopKind::Infinite | LoopKind::For => {

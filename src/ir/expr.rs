@@ -133,6 +133,18 @@ pub enum Expr {
     Cast(CastKind, JavaType, Box<Expr>),
     InstanceOf(Box<Expr>, JavaType),
 
+    /// `cond ? then : else`.
+    ///
+    /// The condition is stored pre-rendered because it originates from a
+    /// branch instruction plus its operand-stack context, which the
+    /// expression layer no longer has access to by the time the two arms
+    /// have been folded together.
+    Ternary {
+        cond:      String,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
+
     // ── field access ──────────────────────────────────────────────────
     Field {
         dir:        FieldDir,
@@ -223,6 +235,7 @@ impl Expr {
             Expr::BinOp(op, _, _) => op.precedence(),
             Expr::Cast(_, _, _) => 1,
             Expr::InstanceOf(_, _) => 6,
+            Expr::Ternary { .. } => 13,
             Expr::Invoke { .. } | Expr::Field { .. } => 0,
             Expr::New { .. } | Expr::NewArray { .. } => 0,
             Expr::Assign { .. } => 14,

@@ -133,6 +133,11 @@ pub struct LoopStmt {
     /// Instructions of the condition block (header for while, tail for do-while).
     /// Stored here so the writer can simulate exactly the right instructions.
     pub cond_insns:    Vec<Instruction>,
+    /// True when the printed condition is the negation of the branch opcode's
+    /// predicate — i.e. the conditional branch *leaves* the loop and control
+    /// stays in the loop on fall-through.  False when the branch is a back-edge
+    /// that continues the loop.
+    pub cond_negated:  bool,
 }
 
 // ── SwitchStmt ───────────────────────────────────────────────────────────

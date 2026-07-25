@@ -712,6 +712,10 @@ fn kt_render_expr_inner(expr: &Expr) -> String {
         Expr::Return(Some(val)) => format!("return {}", kt_render_expr(val)),
         Expr::Return(None) => "return".into(),
 
+        Expr::Ternary { cond, then_expr, else_expr } =>
+            format!("if ({}) {} else {}",
+                cond, kt_render_expr(then_expr), kt_render_expr(else_expr)),
+
         Expr::Opaque { opcode, offset } =>
             format!("/* opaque 0x{:02x} @{} */", opcode, offset),
     }
@@ -1483,7 +1487,7 @@ fn render_loop(
     match s.kind {
         LoopKind::While => {
             let cond = extract_branch_condition(
-                s.header_block, code, pool, is_static, this_class, false, names);
+                s.header_block, code, pool, is_static, this_class, s.cond_negated, names);
 
             // Detect for-in pattern: while (iter.hasNext() ...)
             if cond.contains(".hasNext()") {
@@ -1550,7 +1554,7 @@ fn render_loop(
             render_stmt(arena, s.body, code, pool, is_static, this_class, names, lvt, cf, w);
             w.dedent();
             let cond = extract_branch_condition(
-                s.tail_block, code, pool, is_static, this_class, false, names);
+                s.tail_block, code, pool, is_static, this_class, s.cond_negated, names);
             w.line(&format!("}} while ({})", cond));
         }
         LoopKind::Infinite | LoopKind::For => {
@@ -1652,42 +1656,55 @@ fn try_detect_range_for(cond: &str, _lvt: &[LvtEntry]) -> Option<RangeForInfo> {
     None
 }
 
-/// Parse range-style condition: "i >= 11" → for i in 1..10
+/// Parse range-style condition for Kotlin for-in detection.
+/// Handles both the correct polarity (from the fixed negated flag) and the
+/// legacy inverted forms as a fallback.
+///
+/// "i < 11"  → for (i in 1..10)
+/// "i <= 10" → for (i in 1..10)
+/// "i < N"   → for (i in 1 until N) [open upper end]
 fn parse_range_condition(cond: &str) -> Option<RangeForInfo> {
-    // Pattern: "varname >= limit" (loop condition inverted: continues while var < limit)
     let parts: Vec<&str> = cond.split_whitespace().collect();
-    if parts.len() == 3 {
-        let var_name = parts[0];
-        let op = parts[1];
-        let limit_str = parts[2];
+    if parts.len() != 3 { return None; }
+    let var_name  = parts[0];
+    let op        = parts[1];
+    let limit_str = parts[2];
 
-        // Only handle simple variable names (no dots, brackets)
-        if var_name.contains('.') || var_name.contains('[') {
-            return None;
-        }
+    if var_name.contains('.') || var_name.contains('[') {
+        return None;
+    }
 
-        if let Ok(limit) = limit_str.parse::<i64>() {
-            match op {
-                ">=" => {
-                    // while (i >= limit) is the exit condition
-                    // meaning loop body runs while i < limit
-                    // This is `for (i in start until limit)` or `for (i in start..limit-1)`
-                    let end = limit - 1;
-                    return Some(RangeForInfo {
-                        var_name: var_name.to_string(),
-                        range_expr: format!("1..{}", end),
-                    });
-                }
-                ">" => {
-                    // while (i > limit) exits → loop runs while i <= limit
-                    // This is `for (i in start..limit)`
-                    return Some(RangeForInfo {
-                        var_name: var_name.to_string(),
-                        range_expr: format!("1..{}", limit),
-                    });
-                }
-                _ => {}
+    if let Ok(limit) = limit_str.parse::<i64>() {
+        match op {
+            // Correct-polarity forms (after the negated-flag fix)
+            "<" => {
+                // while (i < limit): body runs for i ∈ [start, limit-1] → `1..limit-1`
+                return Some(RangeForInfo {
+                    var_name:   var_name.to_string(),
+                    range_expr: format!("1..{}", limit - 1),
+                });
             }
+            "<=" => {
+                // while (i <= limit): body runs for i ∈ [start, limit] → `1..limit`
+                return Some(RangeForInfo {
+                    var_name:   var_name.to_string(),
+                    range_expr: format!("1..{}", limit),
+                });
+            }
+            // Legacy inverted forms (kept as fallback)
+            ">=" => {
+                return Some(RangeForInfo {
+                    var_name:   var_name.to_string(),
+                    range_expr: format!("1..{}", limit - 1),
+                });
+            }
+            ">" => {
+                return Some(RangeForInfo {
+                    var_name:   var_name.to_string(),
+                    range_expr: format!("1..{}", limit),
+                });
+            }
+            _ => {}
         }
     }
     None
