@@ -216,6 +216,43 @@ pub fn current_return_is_boolean() -> bool {
     RETURN_TYPE.with(|c| c.borrow().as_ref() == Some(&JavaType::BOOLEAN))
 }
 
+thread_local! {
+    /// Bootstrap-method recipes for `makeConcatWithConstants`.
+    /// Key = bootstrap_attr_index, value = resolved recipe string.
+    /// Set once per ClassFile (before any method bodies are rendered) by
+    /// `set_concat_recipes`; cleared when the ClassFile finishes.
+    static CONCAT_RECIPES: std::cell::RefCell<std::collections::HashMap<u16, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Populate the per-ClassFile recipe table from its BootstrapMethods attribute.
+pub fn set_concat_recipes(
+    cf:   &crate::classfile::classfile::ClassFile,
+    pool: &crate::classfile::constant_pool::ConstantPool,
+) {
+    use crate::classfile::attribute::Attribute;
+    use crate::classfile::constant_pool::CpEntry;
+
+    let mut map = std::collections::HashMap::new();
+    for attr in &cf.attributes {
+        if let Attribute::BootstrapMethods(bsm_list) = attr {
+            for (idx, bsm) in bsm_list.iter().enumerate() {
+                if let Some(&str_idx) = bsm.arguments.first() {
+                    if let Ok(CpEntry::String(s)) = pool.get(str_idx) {
+                        map.insert(idx as u16, s.clone());
+                    }
+                }
+            }
+        }
+    }
+    CONCAT_RECIPES.with(|c| *c.borrow_mut() = map);
+}
+
+/// Look up the recipe string for the given bootstrap_attr_index.
+pub fn get_concat_recipe(idx: u16) -> Option<String> {
+    CONCAT_RECIPES.with(|c| c.borrow().get(&idx).cloned())
+}
+
 // ── Public entry point ────────────────────────────────────────────────────
 
 /// Simulate a single basic block given an initial operand stack.

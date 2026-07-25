@@ -854,6 +854,9 @@ fn decompile_method_body(m: &Method, code: &crate::classfile::attribute::CodeAtt
     // same names used in the signature so the body matches the declaration.
     let param_names = method_param_display_names(m);
     crate::ir::stack_sim::set_param_types_named(&m.descriptor, m.is_static(), &param_names);
+    // Seed concat recipes from BootstrapMethods so string interpolations render
+    // with their literal segments ("Player " + name + " scored " + score).
+    crate::ir::stack_sim::set_concat_recipes(cf, &cf.constant_pool);
     // Also seed declared-local types from the LocalVariableTable, so e.g. a
     // `boolean` local renders as `!flag` / `= false` rather than `== 0` / `= 0`.
     let lvt_types: Vec<(u16, String, String)> = crate::codegen::stmt_writer::lvt_entries(code)

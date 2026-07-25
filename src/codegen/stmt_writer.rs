@@ -115,7 +115,7 @@ fn render_stmt_stacked(
 
         Stmt::Block(b) => {
             let result = simulate_block(&b.instructions, pool, initial_stack, is_static, this_class, names);
-            emit_stmts(&result.stmts, lvt, w);
+            emit_stmts(&result.stmts, lvt, pool, cf, w);
             result.stack_out
         }
 
@@ -143,7 +143,7 @@ fn render_stmt_stacked(
                                     then_expr: Box::new(then_val),
                                     else_expr: Box::new(else_val),
                                 };
-                                emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                                emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
                                 // skip both the if-chain and the return
                                 i += 2;
                                 stack = vec![];
@@ -164,8 +164,6 @@ fn render_stmt_stacked(
 
         Stmt::If(s) => {
             // ── Compound-condition return-ternary fold ─────────────────────
-            // `if (A) { if (B) { return X; } else { return Y; } } else { return Y; }`
-            // → `return A && B ? X : Y;`
             if let Some((conds, then_val, else_val)) =
                 try_extract_compound_return(arena, &s, pool, is_static, this_class, names)
             {
@@ -176,7 +174,7 @@ fn render_stmt_stacked(
                         then_expr: Box::new(then_val),
                         else_expr: Box::new(else_val),
                     };
-                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
                     return vec![];
                 }
             }
@@ -196,7 +194,7 @@ fn render_stmt_stacked(
                         then_expr: Box::new(then_ret),
                         else_expr: Box::new(else_ret),
                     };
-                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
                     return vec![];
                 }
             }
@@ -352,7 +350,13 @@ fn silent_eval(
 /// Track which slots have already had their type declared.
 /// Emit statements, promoting the first assignment of each LVT local from
 /// `var = rhs` to `Type var = rhs`.
-fn emit_stmts(stmts: &[Expr], lvt: &[LvtEntry], w: &mut IndentWriter) {
+fn emit_stmts(
+    stmts: &[Expr],
+    lvt:   &[LvtEntry],
+    pool:  &ConstantPool,
+    cf:    &ClassFile,
+    w:     &mut IndentWriter,
+) {
     // Build a set of slots that still need a declaration.
     // We use a simple Vec<bool> keyed by position in lvt.
     let mut declared = std::collections::HashSet::<u16>::new();
@@ -376,7 +380,7 @@ fn emit_stmts(stmts: &[Expr], lvt: &[LvtEntry], w: &mut IndentWriter) {
                             }
                         }
                     }
-                    render_expr_concat(r)
+                    render_expr_concat(r, pool, cf)
                 };
                 if !declared.contains(&slot) {
                     // Look up the LVT entry for this slot.
@@ -396,10 +400,10 @@ fn emit_stmts(stmts: &[Expr], lvt: &[LvtEntry], w: &mut IndentWriter) {
                     format!("{} = {};", render_expr(lhs), rhs_str)
                 }
             } else {
-                format!("{};", render_expr_concat(expr))
+                format!("{};", render_expr_concat(expr, pool, cf))
             }
         } else {
-            format!("{};", render_expr_concat(expr))
+            format!("{};", render_expr_concat(expr, pool, cf))
         };
         w.line(&line);
     }
@@ -433,18 +437,81 @@ fn type_str_from_descriptor(desc: &str) -> String {
 }
 
 /// Render an expression, desugaring invokedynamic `makeConcatWithConstants`
-/// into a Java `+` string concatenation chain.
-fn render_expr_concat(expr: &Expr) -> String {
-    if let Expr::InvokeDynamic { name, args, .. } = expr {
+/// into a Java `+` string concatenation chain using the BSM recipe string.
+fn render_expr_concat(expr: &Expr, pool: &ConstantPool, cf: &ClassFile) -> String {
+    use crate::classfile::attribute::Attribute;
+    use crate::classfile::constant_pool::CpEntry;
+
+    if let Expr::InvokeDynamic { name, args, bootstrap_index, .. } = expr {
         if name == "makeConcatWithConstants" || name == "makeConcat" {
-            // args: the dynamic arguments (not the recipe).
-            // Simple case: just chain them with +, removing String.valueOf() wrappers.
+            // Look up the recipe string from BootstrapMethods.
+            // Recipe chars: '\u{0001}' = next dynamic arg slot, '\u{0002}' = BSM static constant.
+            let recipe: Option<String> = cf.attributes.iter().find_map(|a| {
+                if let Attribute::BootstrapMethods(bsm_list) = a {
+                    if let Some(bsm) = bsm_list.get(*bootstrap_index as usize) {
+                        if let Some(&str_idx) = bsm.arguments.first() {
+                            if let Ok(CpEntry::String(s)) = pool.get(str_idx) {
+                                return Some(s.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+            if let Some(recipe) = recipe {
+                let mut result  = String::new();
+                let mut literal = String::new();
+                let mut arg_it  = args.iter();
+
+                for ch in recipe.chars() {
+                    match ch {
+                        '\u{0001}' => {
+                            // Flush accumulated literal, then the next dynamic arg.
+                            if !literal.is_empty() {
+                                if !result.is_empty() { result.push_str(" + "); }
+                                result.push('"');
+                                result.push_str(&literal
+                                    .replace('\\', "\\\\")
+                                    .replace('"',  "\\\"")
+                                    .replace('\n', "\\n")
+                                    .replace('\r', "\\r")
+                                    .replace('\t', "\\t"));
+                                result.push('"');
+                                literal.clear();
+                            }
+                            if let Some(arg) = arg_it.next() {
+                                if !result.is_empty() { result.push_str(" + "); }
+                                result.push_str(&strip_string_valueof(arg));
+                            }
+                        }
+                        '\u{0002}' => {
+                            // Static BSM constant — uncommon; fall back to plain join.
+                            return args.iter().map(strip_string_valueof)
+                                       .collect::<Vec<_>>().join(" + ");
+                        }
+                        c => literal.push(c),
+                    }
+                }
+                // Flush any trailing literal.
+                if !literal.is_empty() {
+                    if !result.is_empty() { result.push_str(" + "); }
+                    result.push('"');
+                    result.push_str(&literal
+                        .replace('\\', "\\\\")
+                        .replace('"',  "\\\"")
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                        .replace('\t', "\\t"));
+                    result.push('"');
+                }
+                if !result.is_empty() { return result; }
+            }
+
+            // Fallback: no recipe / empty — chain args with +.
             if !args.is_empty() {
-                let parts: Vec<String> = args.iter().map(|a| {
-                    // Remove String.valueOf(x) → x
-                    strip_string_valueof(a)
-                }).collect();
-                return parts.join(" + ");
+                return args.iter().map(strip_string_valueof)
+                           .collect::<Vec<_>>().join(" + ");
             }
         }
     }

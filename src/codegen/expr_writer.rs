@@ -190,17 +190,68 @@ fn render_expr_inner(expr: &Expr) -> String {
         Expr::InvokeDynamic { name, args, bootstrap_index, .. } => {
             // Desugar Java 9+ string concatenation factory into + chain.
             if name == "makeConcatWithConstants" || name == "makeConcat" {
-                if !args.is_empty() {
-                    let parts: Vec<String> = args.iter().map(|a| {
-                        if let Expr::Invoke {
-                            kind: InvokeKind::Static, owner, name: vname, args: vargs, ..
-                        } = a {
-                            if vname == "valueOf" && owner == "java/lang/String" && vargs.len() == 1 {
-                                return render_expr(&vargs[0]);
-                            }
+                let strip = |a: &Expr| -> String {
+                    if let Expr::Invoke { kind: InvokeKind::Static, owner, name: vname, args: vargs, .. } = a {
+                        if vname == "valueOf" && owner == "java/lang/String" && vargs.len() == 1 {
+                            return render_expr(&vargs[0]);
                         }
-                        render_expr(a)
-                    }).collect();
+                    }
+                    render_expr(a)
+                };
+
+                // Use the recipe string (set by set_concat_recipes) when available.
+                if let Some(recipe) = crate::ir::stack_sim::get_concat_recipe(*bootstrap_index) {
+                    let mut result  = String::new();
+                    let mut literal = String::new();
+                    let mut arg_it  = args.iter();
+
+                    for ch in recipe.chars() {
+                        match ch {
+                            '\u{0001}' => {
+                                if !literal.is_empty() {
+                                    if !result.is_empty() { result.push_str(" + "); }
+                                    result.push('"');
+                                    result.push_str(&literal
+                                        .replace('\\', "\\\\")
+                                        .replace('"',  "\\\"")
+                                        .replace('\n', "\\n")
+                                        .replace('\r', "\\r")
+                                        .replace('\t', "\\t"));
+                                    result.push('"');
+                                    literal.clear();
+                                }
+                                if let Some(arg) = arg_it.next() {
+                                    if !result.is_empty() { result.push_str(" + "); }
+                                    result.push_str(&strip(arg));
+                                }
+                            }
+                            '\u{0002}' => {
+                                // Static BSM constant — fall back to plain join
+                                let parts: Vec<String> = args.iter().map(strip).collect();
+                                return parts.join(" + ");
+                            }
+                            c => literal.push(c),
+                        }
+                    }
+                    if !literal.is_empty() {
+                        if !result.is_empty() { result.push_str(" + "); }
+                        result.push('"');
+                        result.push_str(&literal
+                            .replace('\\', "\\\\")
+                            .replace('"',  "\\\"")
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r")
+                            .replace('\t', "\\t"));
+                        result.push('"');
+                    }
+                    if !result.is_empty() {
+                        return result;
+                    }
+                }
+
+                // Fallback: no recipe — chain args with +.
+                if !args.is_empty() {
+                    let parts: Vec<String> = args.iter().map(strip).collect();
                     return parts.join(" + ");
                 }
             }
