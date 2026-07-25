@@ -126,13 +126,13 @@ fn render_stmt_stacked(
             while i < children.len() {
                 let child = children[i];
 
-                // ── Guard-chain + return fold ──────────────────────────────
-                // Pattern: `if (A) { if (B) { return X; } }` followed by `return Y`
-                // → `return A && B ? X : Y`
                 if let Stmt::If(_) = arena.get(child) {
                     if let Some(next_id) = children.get(i + 1).copied() {
+                        // ── Return guard-chain fold ────────────────────────────
+                        // `if (A) { if (B) { return X; } }` + `return Y`
+                        // → `return A && B ? X : Y`
                         if let Some(else_val) = extract_return_expr(
-                            arena, next_id, pool, is_static, this_class, names)
+                            arena, next_id, vec![], pool, is_static, this_class, names)
                         {
                             if let Some((conds, then_val)) =
                                 try_extract_guard_chain(arena, child, pool, is_static, this_class, names)
@@ -144,9 +144,31 @@ fn render_stmt_stacked(
                                     else_expr: Box::new(else_val),
                                 };
                                 emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, pool, cf, w);
-                                // skip both the if-chain and the return
                                 i += 2;
                                 stack = vec![];
+                                continue;
+                            }
+                        }
+
+                        // ── Value guard-chain fold ─────────────────────────────
+                        // `if (A) { [if (B) { ] push_X [}] }` + push_Y
+                        // → stack value `A [&& B] ? X : Y` (consumed by next stmt)
+                        let else_residual = silent_eval(
+                            arena, next_id, vec![], pool, is_static, this_class, names);
+                        if else_residual.len() == 1 {
+                            if let Some((conds, then_slot)) =
+                                try_extract_guard_chain_value(arena, child, pool, is_static, this_class, names)
+                            {
+                                let cond = conds.join(" && ");
+                                let else_slot = else_residual.into_iter().next().unwrap();
+                                let ty = then_slot.ty.clone();
+                                let ternary = Expr::Ternary {
+                                    cond,
+                                    then_expr: Box::new(then_slot.expr),
+                                    else_expr: Box::new(else_slot.expr),
+                                };
+                                i += 2;
+                                stack = vec![SlotInfo { expr: ternary, ty }];
                                 continue;
                             }
                         }
@@ -163,6 +185,13 @@ fn render_stmt_stacked(
         }
 
         Stmt::If(s) => {
+            // Compute the stack state *after* the condition instructions and branch
+            // have consumed their operands.  Both arms inherit this base stack, so
+            // blocks that start with `xreturn` (consuming a value pushed by their
+            // predecessor) get the right initial_stack instead of an empty one.
+            let cbs = cond_base_stack(
+                &s.cond_insns, pool, initial_stack.clone(), is_static, this_class, names);
+
             // ── Compound-condition return-ternary fold ─────────────────────
             if let Some((conds, then_val, else_val)) =
                 try_extract_compound_return(arena, &s, pool, is_static, this_class, names)
@@ -181,11 +210,12 @@ fn render_stmt_stacked(
 
             // ── Return-ternary fold ────────────────────────────────────────
             // `if (c) { return A; } else { return B; }` → `return c ? A : B;`
-            // This must run before silent_eval so we don't discard the arms.
+            // Pass cbs so arms that pop a value off the predecessor stack don't
+            // produce Opaque{} placeholders.
             if let Some(else_id) = s.else_branch {
                 if let (Some(then_ret), Some(else_ret)) = (
-                    extract_return_expr(arena, s.then_branch, pool, is_static, this_class, names),
-                    extract_return_expr(arena, else_id,        pool, is_static, this_class, names),
+                    extract_return_expr(arena, s.then_branch, cbs.clone(), pool, is_static, this_class, names),
+                    extract_return_expr(arena, else_id,        cbs.clone(), pool, is_static, this_class, names),
                 ) {
                     let cond = condition_from_block_insns(
                         &s.cond_insns, pool, is_static, this_class, s.negated, names);
@@ -200,9 +230,13 @@ fn render_stmt_stacked(
             }
 
             // ── Value-ternary fold ─────────────────────────────────────────
-            let then_residual = silent_eval(arena, s.then_branch, pool, is_static, this_class, names);
+            // Use vec![] here, NOT cbs: we only care what each arm itself produces.
+            // Passing cbs would include pre-condition values (e.g. a `this` pushed
+            // before the branch for a putfield) and inflate the residual to len>1,
+            // breaking the len==1 guard.  The cbs is applied AFTER the fold fires.
+            let then_residual = silent_eval(arena, s.then_branch, vec![], pool, is_static, this_class, names);
             let else_residual = s.else_branch
-                .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
+                .map(|e| silent_eval(arena, e, vec![], pool, is_static, this_class, names))
                 .unwrap_or_default();
 
             // Both arms are pure single-value producers → fold into `c ? a : b`
@@ -224,8 +258,8 @@ fn render_stmt_stacked(
                     then_expr: Box::new(then_slot.expr),
                     else_expr: Box::new(else_slot.expr),
                 };
-                let mut base = cond_base_stack(
-                    &s.cond_insns, pool, initial_stack, is_static, this_class, names);
+                // cbs was computed above from initial_stack; reuse it.
+                let mut base = cbs;
                 base.push(SlotInfo { expr: ternary, ty });
                 return base;
             }
@@ -234,10 +268,7 @@ fn render_stmt_stacked(
 
             // Return the then-branch residual if both branches agree they produce a value.
             if !then_residual.is_empty() && !else_residual.is_empty() {
-                // The base stack after the condition instruction is the pre-branch
-                // simulation output minus the operands consumed by the branch
-                // (1 for ifeq/ifne/…, 2 for if_icmp*/if_acmp*).
-                let mut base = cond_base_stack(&s.cond_insns, pool, initial_stack, is_static, this_class, names);
+                let mut base = cbs;
                 base.extend(then_residual);
                 base
             } else {
@@ -256,8 +287,7 @@ fn render_stmt_stacked(
         }
 
         Stmt::TryCatch(s) => {
-            render_try_catch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w);
-            vec![]
+            render_try_catch(arena, s.clone(), code, pool, is_static, this_class, names, lvt, cf, w)
         }
 
         Stmt::Synchronized(s) => {
@@ -293,17 +323,18 @@ fn render_stmt(
 /// produce a non-empty residual stack (and write nothing visible), that value
 /// is threaded to the next sibling in the `Seq`.
 fn silent_eval(
-    arena:     &StmtArena,
-    id:        StmtId,
-    pool:      &ConstantPool,
-    is_static: bool,
-    this_class: &str,
-    names:     &[(u16, String)],
+    arena:         &StmtArena,
+    id:            StmtId,
+    initial_stack: Vec<SlotInfo>,
+    pool:          &ConstantPool,
+    is_static:     bool,
+    this_class:    &str,
+    names:         &[(u16, String)],
 ) -> Vec<SlotInfo> {
     match arena.get(id) {
         Stmt::Exit => vec![],
         Stmt::Block(b) => {
-            let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
+            let result = simulate_block(&b.instructions, pool, initial_stack, is_static, this_class, names);
             // Only propagate if the block produced no visible statements
             // (i.e. it only pushed a value — no assignments, calls, returns).
             if result.stmts.is_empty() {
@@ -315,7 +346,7 @@ fn silent_eval(
         Stmt::Seq(s) => {
             let mut stack = vec![];
             for &child in &s.children {
-                let child_res = silent_eval(arena, child, pool, is_static, this_class, names);
+                let child_res = silent_eval(arena, child, vec![], pool, is_static, this_class, names);
                 if !child_res.is_empty() { stack = child_res; } else { stack = vec![]; }
             }
             stack
@@ -323,9 +354,9 @@ fn silent_eval(
         Stmt::If(s) => {
             // Recurse so nested ternaries like `a > b ? a : (b > 0 ? b : 0)`
             // propagate a value through the outer else-arm's If as well.
-            let then_r = silent_eval(arena, s.then_branch, pool, is_static, this_class, names);
+            let then_r = silent_eval(arena, s.then_branch, vec![], pool, is_static, this_class, names);
             let else_r = s.else_branch
-                .map(|e| silent_eval(arena, e, pool, is_static, this_class, names))
+                .map(|e| silent_eval(arena, e, vec![], pool, is_static, this_class, names))
                 .unwrap_or_default();
             if then_r.len() == 1 && else_r.len() == 1 {
                 let cond = condition_from_block_insns(
@@ -572,9 +603,59 @@ fn try_extract_guard_chain(
             }
             _ => {
                 // Reached the leaf: must be a plain return.
-                let val = extract_return_expr(arena, effective, pool, is_static, this_class, names)?;
+                let val = extract_return_expr(arena, effective, vec![], pool, is_static, this_class, names)?;
                 if conds.is_empty() { return None; }
                 return Some((conds, val));
+            }
+        }
+    }
+}
+
+/// Like `try_extract_guard_chain` but the leaf is a *value-producing* block
+/// (one that pushes a single value onto the stack) instead of a return block.
+///
+/// Used for patterns like:
+/// ```text
+/// if (A) { [if (B) { ] push_X [}] }
+/// push_Y               // else path
+/// istore / method call // consumer
+/// ```
+/// → stack value `A [&& B] ? X : Y`
+fn try_extract_guard_chain_value(
+    arena:      &StmtArena,
+    id:         StmtId,
+    pool:       &ConstantPool,
+    is_static:  bool,
+    this_class: &str,
+    names:      &[(u16, String)],
+) -> Option<(Vec<String>, SlotInfo)> {
+    let mut conds: Vec<String> = Vec::new();
+    let mut cur = id;
+
+    loop {
+        let effective = match arena.get(cur) {
+            Stmt::Seq(sq) => {
+                let non_empty: Vec<_> = sq.children.iter().copied()
+                    .filter(|&c| !is_stmt_empty(arena, c, pool, is_static, this_class, names))
+                    .collect();
+                if non_empty.len() == 1 { non_empty[0] } else { cur }
+            }
+            _ => cur,
+        };
+
+        match arena.get(effective) {
+            Stmt::If(s) if s.else_branch.is_none() => {
+                let cond = condition_from_block_insns(
+                    &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                conds.push(cond);
+                cur = s.then_branch;
+            }
+            _ => {
+                // Leaf: must be a pure value-producing block (no stmts, 1 stack value).
+                let vals = silent_eval(arena, effective, vec![], pool, is_static, this_class, names);
+                if vals.len() != 1 { return None; }
+                if conds.is_empty() { return None; }
+                return Some((conds, vals.into_iter().next().unwrap()));
             }
         }
     }
@@ -603,7 +684,7 @@ fn try_extract_compound_return(
 ) -> Option<(Vec<String>, Expr, Expr)> {
     // Else branch must return a value.
     let else_id = s.else_branch?;
-    let else_val = extract_return_expr(arena, else_id, pool, is_static, this_class, names)?;
+    let else_val = extract_return_expr(arena, else_id, vec![], pool, is_static, this_class, names)?;
 
     // Collect the chain: then-branch is either a direct return (innermost) or
     // another Stmt::If with the same else value.
@@ -629,7 +710,7 @@ fn try_extract_compound_return(
                 // The inner else must return the SAME value as outer else.
                 let inner_else_id = inner.else_branch?;
                 let inner_else_val = extract_return_expr(
-                    arena, inner_else_id, pool, is_static, this_class, names)?;
+                    arena, inner_else_id, vec![], pool, is_static, this_class, names)?;
                 // Compare by rendered string — simple but sufficient for identical
                 // `return original;` patterns.
                 if render_expr(&inner_else_val) != render_expr(&else_val) {
@@ -643,7 +724,7 @@ fn try_extract_compound_return(
             _ => {
                 // Innermost: must be a direct return of the then-value.
                 let then_val = extract_return_expr(
-                    arena, effective, pool, is_static, this_class, names)?;
+                    arena, effective, vec![], pool, is_static, this_class, names)?;
                 // Must be different from else_val (otherwise it's a degenerate tautology).
                 if render_expr(&then_val) == render_expr(&else_val) {
                     return None;
@@ -673,16 +754,17 @@ fn coerce_bool_const(expr: Expr) -> Expr {
 }
 
 fn extract_return_expr(
-    arena:      &StmtArena,
-    id:         StmtId,
-    pool:       &ConstantPool,
-    is_static:  bool,
-    this_class: &str,
-    names:      &[(u16, String)],
+    arena:         &StmtArena,
+    id:            StmtId,
+    initial_stack: Vec<SlotInfo>,
+    pool:          &ConstantPool,
+    is_static:     bool,
+    this_class:    &str,
+    names:         &[(u16, String)],
 ) -> Option<Expr> {
     match arena.get(id) {
         Stmt::Block(b) => {
-            let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
+            let result = simulate_block(&b.instructions, pool, initial_stack, is_static, this_class, names);
             if result.stmts.len() == 1 {
                 if let Expr::Return(Some(val)) = &result.stmts[0] {
                     // Reject placeholder opaques: they mean the block relied on a
@@ -705,7 +787,7 @@ fn extract_return_expr(
             // a return-only Block (the rest are empty).
             let mut ret_expr = None;
             for &child in &s.children {
-                match extract_return_expr(arena, child, pool, is_static, this_class, names) {
+                match extract_return_expr(arena, child, vec![], pool, is_static, this_class, names) {
                     Some(e) if ret_expr.is_none() => ret_expr = Some(e),
                     None if is_stmt_empty(arena, child, pool, is_static, this_class, names) => {}
                     _ => return None, // multiple returns or non-empty non-return content
@@ -730,7 +812,13 @@ fn is_stmt_empty(
         Stmt::Block(b) => {
             // A block with no instructions produces no visible output.
             if b.instructions.is_empty() { return true; }
-            // A block that only pushes a value and has no side-effecting
+            // A block consisting solely of unconditional jumps (goto/goto_w)
+            // produces no source output — the branch is structural, not textual.
+            use crate::classfile::opcodes::opc;
+            if b.instructions.iter().all(|i| matches!(i.opcode, opc::goto | opc::goto_w)) {
+                return true;
+            }
+            // A block that only pushes values and has no side-effecting
             // statements also produces no visible output.
             let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
             result.stmts.is_empty()
@@ -1157,10 +1245,15 @@ fn render_try_catch(
     code: &CodeAttribute, pool: &ConstantPool,
     is_static: bool, this_class: &str,
     names: &[(u16, String)], lvt: &[LvtEntry], cf: &ClassFile, w: &mut IndentWriter,
-) {
+) -> Vec<SlotInfo> {
     w.line("try {");
     w.indent();
-    render_stmt(arena, s.try_body, code, pool, is_static, this_class, names, lvt, cf, w);
+    // Thread the try body's residual stack outward so that a block immediately
+    // after the try/catch that only does `xreturn` (consuming a value pushed
+    // inside the protected region) gets the correct initial_stack instead of
+    // producing Opaque{}.
+    let try_residual = render_stmt_stacked(
+        arena, s.try_body, vec![], code, pool, is_static, this_class, names, lvt, cf, w);
     w.dedent();
     for clause in &s.catches {
         let ty  = clause.catch_type.as_deref().unwrap_or("java/lang/Throwable");
@@ -1182,6 +1275,9 @@ fn render_try_catch(
         w.dedent();
     }
     w.line("}");
+    // Return the try body's residual stack so the Seq can thread it to any
+    // sibling block that consumes a value pushed inside the protected region.
+    try_residual
 }
 
 /// Find the name the handler stores the exception into, from the LVT entry that
