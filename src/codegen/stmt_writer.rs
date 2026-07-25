@@ -685,6 +685,11 @@ fn extract_return_expr(
             let result = simulate_block(&b.instructions, pool, vec![], is_static, this_class, names);
             if result.stmts.len() == 1 {
                 if let Expr::Return(Some(val)) = &result.stmts[0] {
+                    // Reject placeholder opaques: they mean the block relied on a
+                    // value from its predecessor's stack (pop_expr on empty → Opaque).
+                    if matches!(val.as_ref(), Expr::Opaque { .. }) {
+                        return None;
+                    }
                     let mut expr = *val.clone();
                     // In a boolean-returning method, iconst_0/1 means false/true.
                     if crate::ir::stack_sim::current_return_is_boolean() {
