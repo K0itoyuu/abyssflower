@@ -122,18 +122,65 @@ fn render_stmt_stacked(
         Stmt::Seq(s) => {
             let children = s.children.clone();
             let mut stack = initial_stack;
-            for child in children {
-                // Pass the residual stack only to Block children; other
-                // control-flow nodes consume it.  Most blocks have an
-                // empty incoming stack anyway, so the overhead is tiny.
+            let mut i = 0;
+            while i < children.len() {
+                let child = children[i];
+
+                // ── Guard-chain + return fold ──────────────────────────────
+                // Pattern: `if (A) { if (B) { return X; } }` followed by `return Y`
+                // → `return A && B ? X : Y`
+                if let Stmt::If(_) = arena.get(child) {
+                    if let Some(next_id) = children.get(i + 1).copied() {
+                        if let Some(else_val) = extract_return_expr(
+                            arena, next_id, pool, is_static, this_class, names)
+                        {
+                            if let Some((conds, then_val)) =
+                                try_extract_guard_chain(arena, child, pool, is_static, this_class, names)
+                            {
+                                let cond = conds.join(" && ");
+                                let ternary = Expr::Ternary {
+                                    cond,
+                                    then_expr: Box::new(then_val),
+                                    else_expr: Box::new(else_val),
+                                };
+                                emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                                // skip both the if-chain and the return
+                                i += 2;
+                                stack = vec![];
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Default: render the child normally
                 stack = render_stmt_stacked(
                     arena, child, stack,
                     code, pool, is_static, this_class, names, lvt, cf, w);
+                i += 1;
             }
             stack
         }
 
         Stmt::If(s) => {
+            // ── Compound-condition return-ternary fold ─────────────────────
+            // `if (A) { if (B) { return X; } else { return Y; } } else { return Y; }`
+            // → `return A && B ? X : Y;`
+            if let Some((conds, then_val, else_val)) =
+                try_extract_compound_return(arena, &s, pool, is_static, this_class, names)
+            {
+                if conds.len() >= 2 {
+                    let cond = conds.join(" && ");
+                    let ternary = Expr::Ternary {
+                        cond,
+                        then_expr: Box::new(then_val),
+                        else_expr: Box::new(else_val),
+                    };
+                    emit_stmts(&[Expr::Return(Some(Box::new(ternary)))], lvt, w);
+                    return vec![];
+                }
+            }
+
             // ── Return-ternary fold ────────────────────────────────────────
             // `if (c) { return A; } else { return B; }` → `return c ? A : B;`
             // This must run before silent_eval so we don't discard the arms.
@@ -419,6 +466,127 @@ fn strip_string_valueof(expr: &Expr) -> String {
 /// Returns true when rendering `id` would produce no visible output lines.
 /// Handles the common cases: Exit, an empty Block (zero instructions that
 /// produce no statements), and a Seq/If whose every child is empty.
+/// Walk a no-else if-chain and extract the compound condition + innermost return value.
+///
+/// Handles: `if (A) { if (B) { if (C) { return X; } } }` → `(["A","B","C"], X)`.
+/// Only follows then-branches with no else clause.  Stops when the then-branch
+/// is a plain return block.
+fn try_extract_guard_chain(
+    arena:      &StmtArena,
+    id:         StmtId,
+    pool:       &ConstantPool,
+    is_static:  bool,
+    this_class: &str,
+    names:      &[(u16, String)],
+) -> Option<(Vec<String>, Expr)> {
+    let mut conds: Vec<String> = Vec::new();
+    let mut cur = id;
+
+    loop {
+        // Unwrap a single-element Seq to its If child.
+        let effective = match arena.get(cur) {
+            Stmt::Seq(sq) => {
+                let non_empty: Vec<_> = sq.children.iter().copied()
+                    .filter(|&c| !is_stmt_empty(arena, c, pool, is_static, this_class, names))
+                    .collect();
+                if non_empty.len() == 1 { non_empty[0] } else { cur }
+            }
+            _ => cur,
+        };
+
+        match arena.get(effective) {
+            Stmt::If(s) => {
+                // Only follow no-else chains.
+                if s.else_branch.is_some() { return None; }
+                let cond = condition_from_block_insns(
+                    &s.cond_insns, pool, is_static, this_class, s.negated, names);
+                conds.push(cond);
+                cur = s.then_branch;
+            }
+            _ => {
+                // Reached the leaf: must be a plain return.
+                let val = extract_return_expr(arena, effective, pool, is_static, this_class, names)?;
+                if conds.is_empty() { return None; }
+                return Some((conds, val));
+            }
+        }
+    }
+}
+
+/// Detect a short-circuit `&&` chain compiled as nested if-statements:
+///
+/// ```text
+/// if (A) {
+///     if (B) {
+///         if (C) { return X; } else { return Y; }
+///     } else { return Y; }
+/// } else { return Y; }
+/// ```
+/// → `return A && B && C ? X : Y;`
+///
+/// Returns `(condition_parts, then_val, else_val)` if the pattern matches,
+/// where each `condition_parts[i]` is a single rendered condition clause.
+fn try_extract_compound_return(
+    arena:      &StmtArena,
+    s:          &IfStmt,
+    pool:       &ConstantPool,
+    is_static:  bool,
+    this_class: &str,
+    names:      &[(u16, String)],
+) -> Option<(Vec<String>, Expr, Expr)> {
+    // Else branch must return a value.
+    let else_id = s.else_branch?;
+    let else_val = extract_return_expr(arena, else_id, pool, is_static, this_class, names)?;
+
+    // Collect the chain: then-branch is either a direct return (innermost) or
+    // another Stmt::If with the same else value.
+    let cond0 = condition_from_block_insns(
+        &s.cond_insns, pool, is_static, this_class, s.negated, names);
+    let mut conds = vec![cond0];
+
+    let mut then_id = s.then_branch;
+    loop {
+        // Unwrap a single-child Seq to get the nested If, if present.
+        let effective = match arena.get(then_id) {
+            Stmt::Seq(sq) => {
+                let non_empty: Vec<_> = sq.children.iter().copied()
+                    .filter(|&c| !is_stmt_empty(arena, c, pool, is_static, this_class, names))
+                    .collect();
+                if non_empty.len() == 1 { non_empty[0] } else { then_id }
+            }
+            _ => then_id,
+        };
+
+        match arena.get(effective) {
+            Stmt::If(inner) => {
+                // The inner else must return the SAME value as outer else.
+                let inner_else_id = inner.else_branch?;
+                let inner_else_val = extract_return_expr(
+                    arena, inner_else_id, pool, is_static, this_class, names)?;
+                // Compare by rendered string — simple but sufficient for identical
+                // `return original;` patterns.
+                if render_expr(&inner_else_val) != render_expr(&else_val) {
+                    return None;
+                }
+                let cond_i = condition_from_block_insns(
+                    &inner.cond_insns, pool, is_static, this_class, inner.negated, names);
+                conds.push(cond_i);
+                then_id = inner.then_branch;
+            }
+            _ => {
+                // Innermost: must be a direct return of the then-value.
+                let then_val = extract_return_expr(
+                    arena, effective, pool, is_static, this_class, names)?;
+                // Must be different from else_val (otherwise it's a degenerate tautology).
+                if render_expr(&then_val) == render_expr(&else_val) {
+                    return None;
+                }
+                return Some((conds, then_val, else_val));
+            }
+        }
+    }
+}
+
 /// If `id` is a block whose only effect is `return <expr>`, return that expr.
 /// Used to fold `if (c) { return A; } else { return B; }` → `return c ? A : B`.
 fn extract_return_expr(
