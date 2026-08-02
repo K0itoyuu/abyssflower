@@ -26,9 +26,10 @@ Abyssflower reads `.class` files and produces idiomatic Kotlin (or Java) source 
 - Property initializers from `<init>`/`<clinit>` bytecode
 
 **Performance**
-- ~23ms per class file (9x faster than Vineflower on equivalent workload)
 - Zero JVM startup cost — native Rust binary
-- Single-file processing — no classpath required
+- Parallel class parsing and Kotlin source-unit rendering
+- Indexed cross-class lookup for grouped Kotlin decompilation
+- Single-file, directory, and whole-archive processing
 
 ## Usage
 
@@ -38,6 +39,8 @@ Abyssflower reads `.class` files and produces idiomatic Kotlin (or Java) source 
 abyssflower <class-file>
 abyssflower file1.class file2.class ...
 abyssflower <class-file> -o <output-dir>
+abyssflower <classes-directory> -o <output-dir>
+abyssflower --jar app.jar -o <output-dir>
 abyssflower --jar app.jar --entry com/example/Main.class
 ```
 
@@ -46,6 +49,10 @@ Output language can be selected explicitly with `--java`, `--kotlin`, or
 present; `--auto` falls back to Java and reports a diagnostic when malformed
 Kotlin metadata is encountered. Invalid arguments exit with status 2, runtime
 decompilation or I/O failures with status 1, and successful runs with status 0.
+Complete archives and directory inputs require `--output`; archive entries and
+individual class files may still be written to stdout. Batch inputs are parsed
+in parallel, while related Kotlin classes share one indexed group context so
+nested classes, companions, and multi-file facades can be merged consistently.
 
 Inputs are resource-bounded by default: class files and uncompressed archive
 entries are limited to 64 MiB, while the archive itself is limited to 512 MiB.

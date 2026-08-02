@@ -12,8 +12,8 @@ use clap::{ArgGroup, Parser};
 #[command(version, about, arg_required_else_help = true)]
 #[command(group(ArgGroup::new("language").args(["java", "kotlin", "auto"]).multiple(false)))]
 struct Cli {
-    /// Class files to decompile.
-    #[arg(value_name = "CLASS", num_args = 0.., conflicts_with = "jar")]
+    /// Class files or directories to decompile.
+    #[arg(value_name = "INPUT", num_args = 0.., conflicts_with = "jar")]
     files: Vec<PathBuf>,
 
     /// Write sources below this directory instead of stdout.
@@ -32,11 +32,11 @@ struct Cli {
     #[arg(long, conflicts_with = "mcp")]
     auto: bool,
 
-    /// Read a class entry from this JAR/ZIP archive.
-    #[arg(long, value_name = "JAR", requires = "entry")]
+    /// Decompile a JAR/ZIP archive, or one entry when --entry is provided.
+    #[arg(long, value_name = "JAR")]
     jar: Option<PathBuf>,
 
-    /// Internal .class path used with --jar.
+    /// Optional internal .class path used with --jar.
     #[arg(long, value_name = "ENTRY", requires = "jar")]
     entry: Option<String>,
 
@@ -99,36 +99,52 @@ fn main() -> ExitCode {
     });
 
     let mut failed = false;
-    if let (Some(jar), Some(entry)) = (&cli.jar, &cli.entry) {
-        match decompiler.decompile_jar_entry(jar, entry) {
-            Ok(output) => {
-                if let Err(error) = emit(&output, cli.output.as_deref(), Some(entry)) {
-                    eprintln!("Error: could not write output: {error}");
+    if let Some(jar) = &cli.jar {
+        if let Some(entry) = &cli.entry {
+            match decompiler.decompile_jar_entry(jar, entry) {
+                Ok(output) => {
+                    if let Err(error) = emit(&output, cli.output.as_deref(), Some(entry)) {
+                        eprintln!("Error: could not write output: {error}");
+                        failed = true;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Error: {}!{}: {error}", jar.display(), entry);
                     failed = true;
                 }
             }
-            Err(error) => {
-                eprintln!("Error: {}!{}: {error}", jar.display(), entry);
-                failed = true;
+        } else {
+            let Some(output_dir) = cli.output.as_deref() else {
+                eprintln!("Error: --output is required when decompiling a complete archive");
+                return ExitCode::from(2);
+            };
+            match decompiler.decompile_jar(jar) {
+                Ok(outputs) => {
+                    failed |= emit_all(&outputs, Some(output_dir));
+                }
+                Err(error) => {
+                    eprintln!("Error: {}: {error}", jar.display());
+                    failed = true;
+                }
             }
         }
     } else {
         if cli.files.is_empty() {
-            eprintln!("Error: provide at least one CLASS or use --jar with --entry");
+            eprintln!("Error: provide at least one INPUT or use --jar");
             return ExitCode::from(2);
         }
-        if language == DecompileLanguage::Kotlin && cli.files.len() > 1 {
-            match decompiler.decompile_kotlin_files(&cli.files) {
+        let contains_directory = cli.files.iter().any(|path| path.is_dir());
+        if contains_directory && cli.output.is_none() {
+            eprintln!("Error: --output is required when decompiling a directory");
+            return ExitCode::from(2);
+        }
+        if cli.files.len() > 1 || contains_directory {
+            match decompiler.decompile_paths(&cli.files) {
                 Ok(outputs) => {
-                    for output in outputs {
-                        if let Err(error) = emit(&output, cli.output.as_deref(), None) {
-                            eprintln!("Error: could not write grouped Kotlin output: {error}");
-                            failed = true;
-                        }
-                    }
+                    failed |= emit_all(&outputs, cli.output.as_deref());
                 }
                 Err(error) => {
-                    eprintln!("Error: could not decompile Kotlin class group: {error}");
+                    eprintln!("Error: could not decompile inputs: {error}");
                     failed = true;
                 }
             }
@@ -158,6 +174,20 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+fn emit_all(outputs: &[DecompileOutput], output_dir: Option<&Path>) -> bool {
+    let mut failed = false;
+    for output in outputs {
+        if let Err(error) = emit(output, output_dir, None) {
+            eprintln!(
+                "Error: could not write output for {}: {error}",
+                output.class_name
+            );
+            failed = true;
+        }
+    }
+    failed
 }
 
 fn emit(output: &DecompileOutput, output_dir: Option<&Path>, origin: Option<&str>) -> Result<()> {

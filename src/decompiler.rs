@@ -1,13 +1,17 @@
 //! High-level, resource-bounded decompilation API shared by every frontend.
 
 use std::fs::File;
-use std::io::{Cursor, Read, Take};
+use std::io::{BufReader, Read, Take};
 use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::classfile::ClassFile;
 use crate::codegen::render_class;
 use crate::error::{DecompileError, Result};
-use crate::kotlin::writer::{is_kotlin_class, render_kotlin_group, try_render_kotlin_class};
+use crate::kotlin::writer::{
+    has_valid_kotlin_metadata, is_kotlin_class, render_kotlin_group, try_render_kotlin_class,
+};
 
 pub const DEFAULT_MAX_CLASS_SIZE: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_ARCHIVE_SIZE: u64 = 512 * 1024 * 1024;
@@ -87,19 +91,76 @@ impl Decompiler {
     }
 
     pub fn decompile_kotlin_files(&self, paths: &[PathBuf]) -> Result<Vec<DecompileOutput>> {
-        let mut classes = Vec::with_capacity(paths.len());
+        let classes = paths
+            .par_iter()
+            .map(|path| self.read_class_file(path))
+            .collect::<Result<Vec<_>>>()?;
+        self.render_kotlin_classes(&classes)
+    }
+
+    pub fn decompile_paths(&self, paths: &[PathBuf]) -> Result<Vec<DecompileOutput>> {
+        let mut class_paths = Vec::new();
         for path in paths {
-            let file = File::open(path)?;
-            enforce_size(file.metadata()?.len(), self.options.max_class_size)?;
-            let bytes = read_limited(file, self.options.max_class_size)?;
-            let class = ClassFile::parse(&bytes)?;
-            validate_class_name(&class.this_class)?;
-            if !is_kotlin_class(&class) {
-                return Err(DecompileError::InvalidKotlinMetadata);
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() {
+                continue;
             }
-            classes.push(class);
+            if metadata.is_dir() {
+                collect_class_paths(path, &mut class_paths)?;
+            } else if metadata.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "class")
+            {
+                class_paths.push(path.clone());
+            }
         }
-        render_kotlin_group(&classes)
+        class_paths.sort_unstable();
+        let classes = class_paths
+            .par_iter()
+            .map(|path| self.read_class_file(path))
+            .collect::<Result<Vec<_>>>()?;
+        self.decompile_classes(classes)
+    }
+
+    pub fn decompile_directory(&self, path: impl AsRef<Path>) -> Result<Vec<DecompileOutput>> {
+        self.decompile_paths(&[path.as_ref().to_path_buf()])
+    }
+
+    pub fn decompile_jar(&self, jar_path: impl AsRef<Path>) -> Result<Vec<DecompileOutput>> {
+        let file = File::open(jar_path)?;
+        enforce_size(file.metadata()?.len(), self.options.max_archive_size)?;
+        let mut archive = zip::ZipArchive::new(BufReader::new(file)).map_err(zip_io_error)?;
+        let mut class_bytes = Vec::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).map_err(zip_io_error)?;
+            if entry.is_dir() || !entry.name().ends_with(".class") {
+                continue;
+            }
+            enforce_size(entry.size(), self.options.max_archive_entry_size)?;
+            enforce_size(entry.size(), self.options.max_class_size)?;
+            class_bytes.push(read_limited(
+                entry,
+                self.options
+                    .max_archive_entry_size
+                    .min(self.options.max_class_size),
+            )?);
+        }
+        let classes = class_bytes
+            .par_iter()
+            .map(|bytes| parse_class(bytes))
+            .collect::<Result<Vec<_>>>()?;
+        self.decompile_classes(classes)
+    }
+
+    fn render_kotlin_classes(&self, classes: &[ClassFile]) -> Result<Vec<DecompileOutput>> {
+        if classes
+            .iter()
+            .any(|class| !has_valid_kotlin_metadata(class))
+        {
+            return Err(DecompileError::InvalidKotlinMetadata);
+        }
+        render_kotlin_group(classes)
             .into_iter()
             .map(|unit| {
                 validate_class_name(&unit.class_name)?;
@@ -114,6 +175,40 @@ impl Decompiler {
             .collect()
     }
 
+    fn decompile_classes(&self, classes: Vec<ClassFile>) -> Result<Vec<DecompileOutput>> {
+        let mut outputs = match self.options.language {
+            DecompileLanguage::Kotlin => self.render_kotlin_classes(&classes)?,
+            DecompileLanguage::Java => classes
+                .par_iter()
+                .map(|class| self.decompile_class(class))
+                .collect::<Result<Vec<_>>>()?,
+            DecompileLanguage::Auto => {
+                let (kotlin, java): (Vec<_>, Vec<_>) =
+                    classes.into_iter().partition(has_valid_kotlin_metadata);
+                let (kotlin, java) = rayon::join(
+                    || self.render_kotlin_classes(&kotlin),
+                    || {
+                        java.par_iter()
+                            .map(|class| self.decompile_class(class))
+                            .collect::<Result<Vec<_>>>()
+                    },
+                );
+                let mut outputs = kotlin?;
+                outputs.extend(java?);
+                outputs
+            }
+        };
+        outputs.sort_unstable_by(|left, right| left.class_name.cmp(&right.class_name));
+        Ok(outputs)
+    }
+
+    fn read_class_file(&self, path: &Path) -> Result<ClassFile> {
+        let file = File::open(path)?;
+        enforce_size(file.metadata()?.len(), self.options.max_class_size)?;
+        let bytes = read_limited(file, self.options.max_class_size)?;
+        parse_class(&bytes)
+    }
+
     pub fn decompile_jar_entry(
         &self,
         jar_path: impl AsRef<Path>,
@@ -121,14 +216,18 @@ impl Decompiler {
     ) -> Result<DecompileOutput> {
         let file = File::open(jar_path)?;
         enforce_size(file.metadata()?.len(), self.options.max_archive_size)?;
-        let archive_bytes = read_limited(file, self.options.max_archive_size)?;
-        let mut archive = zip::ZipArchive::new(Cursor::new(archive_bytes))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut archive = zip::ZipArchive::new(BufReader::new(file)).map_err(zip_io_error)?;
         let entry = archive
             .by_name(entry_path)
             .map_err(|_| DecompileError::JarEntryNotFound(entry_path.to_owned()))?;
         enforce_size(entry.size(), self.options.max_archive_entry_size)?;
-        let bytes = read_limited(entry, self.options.max_archive_entry_size)?;
+        enforce_size(entry.size(), self.options.max_class_size)?;
+        let bytes = read_limited(
+            entry,
+            self.options
+                .max_archive_entry_size
+                .min(self.options.max_class_size),
+        )?;
         self.decompile_bytes(&bytes)
     }
 
@@ -161,6 +260,37 @@ impl Decompiler {
             diagnostics,
         })
     }
+}
+
+fn parse_class(bytes: &[u8]) -> Result<ClassFile> {
+    let class = ClassFile::parse(bytes)?;
+    validate_class_name(&class.this_class)?;
+    Ok(class)
+}
+
+fn collect_class_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_class_paths(&path, paths)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "class")
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn zip_io_error(error: zip::result::ZipError) -> DecompileError {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error).into()
 }
 
 fn source_diagnostics(source: &str) -> Vec<DecompileDiagnostic> {
@@ -332,8 +462,55 @@ mod tests {
             entry_limited.decompile_jar_entry(&path, "fixture/ControlFlowFixture.class"),
             Err(DecompileError::InputTooLarge { limit: 1, .. })
         ));
+        assert!(matches!(
+            entry_limited.decompile_jar(&path),
+            Err(DecompileError::InputTooLarge { limit: 1, .. })
+        ));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn decompiles_complete_archive_and_directory() {
+        let jar_path = temp_path("complete.jar");
+        let file = File::create(&jar_path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, bytes) in [
+            (
+                "fixture/ControlFlowFixture.class",
+                include_bytes!("../tests/java_classes/fixture/ControlFlowFixture.class").as_slice(),
+            ),
+            (
+                "fixture/WriterEdgeFixture.class",
+                include_bytes!("../tests/java_classes/fixture/WriterEdgeFixture.class").as_slice(),
+            ),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+
+        let decompiler = Decompiler::new(DecompileOptions {
+            language: DecompileLanguage::Java,
+            ..DecompileOptions::default()
+        });
+        let archive_outputs = decompiler.decompile_jar(&jar_path).unwrap();
+        assert_eq!(archive_outputs.len(), 2);
+        assert_eq!(archive_outputs[0].class_name, "fixture/ControlFlowFixture");
+        assert_eq!(archive_outputs[1].class_name, "fixture/WriterEdgeFixture");
+
+        let directory_outputs = decompiler
+            .decompile_directory("tests/java_classes")
+            .unwrap();
+        assert!(directory_outputs
+            .iter()
+            .any(|output| output.class_name == "fixture/ControlFlowFixture"));
+        assert!(directory_outputs
+            .iter()
+            .any(|output| output.class_name == "fixture/WriterEdgeFixture"));
+        std::fs::remove_file(jar_path).unwrap();
     }
 
     #[test]

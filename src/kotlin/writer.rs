@@ -20,17 +20,64 @@ use crate::codegen::render_context::RenderContext;
 use crate::ir::{ConstExpr, ConstValue, Expr, FieldDir, LambdaBootstrap};
 use crate::types::descriptor::MethodDescriptor;
 use crate::types::java_type::{JavaType, TypeKind};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KotlinSourceUnit {
     pub class_name: String,
     pub source: String,
 }
 
+pub(crate) struct KotlinGroupContext<'a> {
+    classes: &'a [ClassFile],
+    by_name: HashMap<&'a str, &'a ClassFile>,
+    function_objects: OnceLock<Vec<(String, String, usize)>>,
+}
+
+impl<'a> KotlinGroupContext<'a> {
+    fn new(classes: &'a [ClassFile]) -> Self {
+        Self {
+            classes,
+            by_name: classes
+                .iter()
+                .map(|class| (class.this_class.as_str(), class))
+                .collect(),
+            function_objects: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, class_name: &str) -> Option<&'a ClassFile> {
+        self.by_name.get(class_name).copied()
+    }
+
+    pub(crate) fn function_objects(&self) -> &[(String, String, usize)] {
+        self.function_objects.get_or_init(|| {
+            self.classes
+                .iter()
+                .filter_map(|class| {
+                    let (lambda, capture_count) = decompile_kotlin_function_object(class)?;
+                    Some((
+                        format!("{}(", kotlin_class_name(&class.this_class)),
+                        lambda,
+                        capture_count,
+                    ))
+                })
+                .collect()
+        })
+    }
+}
+
 /// Check if a class file is a Kotlin class (has @kotlin/Metadata).
 pub fn is_kotlin_class(cf: &ClassFile) -> bool {
     get_kotlin_annotations(cf).is_some()
+}
+
+pub(crate) fn has_valid_kotlin_metadata(cf: &ClassFile) -> bool {
+    get_kotlin_annotations(cf)
+        .and_then(parse_kotlin_metadata)
+        .is_some()
 }
 
 /// Get RuntimeVisibleAnnotations from a class file.
@@ -50,15 +97,16 @@ fn get_kotlin_annotations(cf: &ClassFile) -> Option<&[crate::classfile::attribut
 
 /// Main entry: render a Kotlin class file to Kotlin source.
 pub fn render_kotlin_class(cf: &ClassFile) -> String {
-    render_kotlin_class_with_backing(cf, None, &[])
+    let context = KotlinGroupContext::new(std::slice::from_ref(cf));
+    render_kotlin_class_with_backing(cf, None, &context)
 }
 
 fn render_kotlin_class_with_backing(
     cf: &ClassFile,
     backing: Option<&ClassFile>,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> String {
-    try_render_kotlin_class_with_backing(cf, backing, related).unwrap_or_else(|| {
+    try_render_kotlin_class_with_backing(cf, backing, context).unwrap_or_else(|| {
         if is_kotlin_class(cf) {
             String::from("// Failed to parse Kotlin metadata\n")
         } else {
@@ -71,13 +119,14 @@ fn render_kotlin_class_with_backing(
 /// are consumed as implementation details; nested/companion declarations are
 /// inserted into their host and multi-file parts are merged into the facade.
 pub fn render_kotlin_group(classes: &[ClassFile]) -> Vec<KotlinSourceUnit> {
+    let context = KotlinGroupContext::new(classes);
     struct Entry<'a> {
         class: &'a ClassFile,
         metadata: KotlinMetadata,
     }
 
     let entries: Vec<Entry<'_>> = classes
-        .iter()
+        .par_iter()
         .filter_map(|class| {
             let annotations = get_kotlin_annotations(class)?;
             Some(Entry {
@@ -92,34 +141,37 @@ pub fn render_kotlin_group(classes: &[ClassFile]) -> Vec<KotlinSourceUnit> {
         .collect();
     let mut units = BTreeMap::<String, String>::new();
     let mut nested = Vec::<(String, String, Option<String>)>::new();
-    let mut multi_parts = HashMap::<String, Vec<String>>::new();
+    let mut multi_parts = BTreeMap::<String, Vec<String>>::new();
 
-    for entry in &entries {
-        match entry.metadata.kind {
-            MetadataKind::SyntheticClass => continue,
-            MetadataKind::MultiFileFacade => {
-                units
-                    .entry(entry.class.this_class.clone())
-                    .or_insert_with(|| package_prefix(entry.class, &entry.metadata));
-            }
+    enum RenderedEntry {
+        Skip,
+        Unit(String, String),
+        Nested(String, String, Option<String>),
+        MultiFileFacade(String, String),
+        MultiFilePart(String, String),
+    }
+
+    let rendered: Vec<RenderedEntry> = entries
+        .par_iter()
+        .map(|entry| match entry.metadata.kind {
+            MetadataKind::SyntheticClass => RenderedEntry::Skip,
+            MetadataKind::MultiFileFacade => RenderedEntry::MultiFileFacade(
+                entry.class.this_class.clone(),
+                package_prefix(entry.class, &entry.metadata),
+            ),
             MetadataKind::MultiFilePart => {
                 let facade = multi_file_facade_name(entry.class, &entry.metadata);
                 let body = source_body(&render_kotlin_class_with_backing(
                     entry.class,
                     None,
-                    classes,
+                    &context,
                 ));
-                multi_parts.entry(facade).or_default().push(body);
+                RenderedEntry::MultiFilePart(facade, body)
             }
             MetadataKind::Class => {
                 let immediate_host = immediate_kotlin_host(entry.class);
-                let backing = immediate_host.as_ref().and_then(|host| {
-                    entries
-                        .iter()
-                        .find(|candidate| candidate.class.this_class == *host)
-                        .map(|candidate| candidate.class)
-                });
-                let source = render_kotlin_class_with_backing(entry.class, backing, classes);
+                let backing = immediate_host.as_ref().and_then(|host| context.get(host));
+                let source = render_kotlin_class_with_backing(entry.class, backing, &context);
                 if let Some(host) = immediate_host {
                     if available.contains(host.as_str()) {
                         let enum_entry = entry
@@ -136,8 +188,7 @@ pub fn render_kotlin_group(classes: &[ClassFile]) -> Vec<KotlinSourceUnit> {
                                     .unwrap_or(entry.class.simple_name())
                                     .to_string()
                             });
-                        nested.push((host, source, enum_entry));
-                        continue;
+                        return RenderedEntry::Nested(host, source, enum_entry);
                     }
                     // Local/anonymous/inlined implementation classes can have
                     // several synthetic `$...` owners that are not emitted as
@@ -145,16 +196,32 @@ pub fn render_kotlin_group(classes: &[ClassFile]) -> Vec<KotlinSourceUnit> {
                     // implementation class belongs to that unit and must not
                     // become a standalone Kotlin file.
                     if nearest_available_host(&host, &available).is_some() {
-                        continue;
+                        return RenderedEntry::Skip;
                     }
                 }
-                units.insert(entry.class.this_class.clone(), source);
+                RenderedEntry::Unit(entry.class.this_class.clone(), source)
             }
-            MetadataKind::FileFacade => {
-                units.insert(
-                    entry.class.this_class.clone(),
-                    render_kotlin_class_with_backing(entry.class, None, classes),
-                );
+            MetadataKind::FileFacade => RenderedEntry::Unit(
+                entry.class.this_class.clone(),
+                render_kotlin_class_with_backing(entry.class, None, &context),
+            ),
+        })
+        .collect();
+
+    for entry in rendered {
+        match entry {
+            RenderedEntry::Skip => {}
+            RenderedEntry::Unit(class_name, source) => {
+                units.insert(class_name, source);
+            }
+            RenderedEntry::Nested(host, source, enum_entry) => {
+                nested.push((host, source, enum_entry));
+            }
+            RenderedEntry::MultiFileFacade(class_name, source) => {
+                units.entry(class_name).or_insert(source);
+            }
+            RenderedEntry::MultiFilePart(facade, body) => {
+                multi_parts.entry(facade).or_default().push(body);
             }
         }
     }
@@ -347,13 +414,14 @@ fn merge_enum_entry_declaration(host: &mut String, entry_name: &str, child: &str
 
 /// Render a Kotlin class, returning `None` when metadata is absent or invalid.
 pub fn try_render_kotlin_class(cf: &ClassFile) -> Option<String> {
-    try_render_kotlin_class_with_backing(cf, None, &[])
+    let context = KotlinGroupContext::new(std::slice::from_ref(cf));
+    try_render_kotlin_class_with_backing(cf, None, &context)
 }
 
 fn try_render_kotlin_class_with_backing(
     cf: &ClassFile,
     backing: Option<&ClassFile>,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> Option<String> {
     let anns = get_kotlin_annotations(cf)?;
     let metadata = parse_kotlin_metadata(anns)?;
@@ -373,12 +441,12 @@ fn try_render_kotlin_class_with_backing(
     match metadata.kind {
         MetadataKind::Class => {
             if let Some(ref cls) = metadata.class {
-                render_class_decl(&mut out, cf, cls, backing, related);
+                render_class_decl(&mut out, cf, cls, backing, context);
             }
         }
         MetadataKind::FileFacade | MetadataKind::MultiFilePart => {
             if let Some(ref pkg) = metadata.package {
-                render_file_facade(&mut out, cf, pkg, related);
+                render_file_facade(&mut out, cf, pkg, context);
             }
         }
         MetadataKind::SyntheticClass => {
@@ -400,7 +468,7 @@ fn render_class_decl(
     cf: &ClassFile,
     cls: &KClass,
     backing: Option<&ClassFile>,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) {
     let kind = cls.flags.class_kind();
 
@@ -527,7 +595,7 @@ fn render_class_decl(
 
     if has_body {
         out.push_str(" {\n");
-        render_class_body(out, cf, cls, backing, related);
+        render_class_body(out, cf, cls, backing, context);
         out.push_str("}\n");
     } else {
         out.push('\n');
@@ -634,7 +702,7 @@ fn render_class_body(
     cf: &ClassFile,
     cls: &KClass,
     backing: Option<&ClassFile>,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) {
     let tp = &cls.type_parameters;
     let in_interface = cls.flags.class_kind() == ClassKind::Interface;
@@ -669,7 +737,7 @@ fn render_class_body(
                 continue;
             }
         }
-        render_property(out, prop, tp, in_interface, cf, backing, related);
+        render_property(out, prop, tp, in_interface, cf, backing, context);
     }
 
     // Functions
@@ -699,9 +767,9 @@ fn render_property(
     in_interface: bool,
     cf: &ClassFile,
     backing: Option<&ClassFile>,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) {
-    let init_val = get_field_initial_value(cf, backing, prop, related);
+    let init_val = get_field_initial_value(cf, backing, prop, context);
     let inferred_anonymous_type = init_val
         .as_deref()
         .is_some_and(|value| value.trim_start().starts_with("object"))
@@ -974,11 +1042,16 @@ fn render_function(
 
 // ── File facade rendering ─────────────────────────────────────────────────
 
-fn render_file_facade(out: &mut String, cf: &ClassFile, pkg: &KPackage, related: &[ClassFile]) {
+fn render_file_facade(
+    out: &mut String,
+    cf: &ClassFile,
+    pkg: &KPackage,
+    context: &KotlinGroupContext<'_>,
+) {
     let tp: &[KTypeParameter] = &[];
 
     for prop in &pkg.properties {
-        render_top_level_property(out, prop, tp, cf, related);
+        render_top_level_property(out, prop, tp, cf, context);
     }
 
     if !pkg.properties.is_empty() && !pkg.functions.is_empty() {
@@ -995,9 +1068,9 @@ fn render_top_level_property(
     prop: &KProperty,
     type_params: &[KTypeParameter],
     cf: &ClassFile,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) {
-    let init_val = get_field_initial_value(cf, None, prop, related);
+    let init_val = get_field_initial_value(cf, None, prop, context);
     // Visibility
     let vis = prop.flags.visibility();
     match vis {
@@ -1774,7 +1847,7 @@ fn get_field_initial_value(
     cf: &ClassFile,
     backing: Option<&ClassFile>,
     prop: &KProperty,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> Option<String> {
     use crate::classfile::attribute::Attribute;
     let prop_name = prop
@@ -1831,16 +1904,17 @@ fn get_field_initial_value(
             None => continue,
         };
 
-        let context = RenderContext::for_method(code, storage, m.is_static(), &m.descriptor, &[])
-            .with_lambda_bootstrap(&lambda_bootstrap);
-        let result = context.simulate(&code.instructions, vec![]);
+        let render_context =
+            RenderContext::for_method(code, storage, m.is_static(), &m.descriptor, &[])
+                .with_lambda_bootstrap(&lambda_bootstrap);
+        let result = render_context.simulate(&code.instructions, vec![]);
         if let Some(value) = recover_field_value(
             &result.stmts,
             &storage.this_class,
             prop_name,
             &m.descriptor,
             m.is_static(),
-            related,
+            context,
         ) {
             return Some(value);
         }
@@ -1985,7 +2059,7 @@ fn recover_field_value(
     field_name: &str,
     method_descriptor: &str,
     is_static: bool,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> Option<String> {
     let mut locals = HashMap::<u16, Expr>::new();
     let mut recovered = None;
@@ -2043,7 +2117,7 @@ fn recover_field_value(
     }
 
     let mut value = recovered?;
-    replace_suspend_lambda_constructors(&mut value, related);
+    replace_suspend_lambda_constructors(&mut value, context);
     let allowed_locals = initializer_parameter_slots(method_descriptor, is_static);
     if !initializer_expr_is_safe(&value, &allowed_locals) {
         return None;
@@ -2162,10 +2236,10 @@ fn initializer_parameter_slots(descriptor: &str, is_static: bool) -> HashSet<u16
     slots
 }
 
-fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
+fn replace_suspend_lambda_constructors(expr: &mut Expr, context: &KotlinGroupContext<'_>) {
     if let Expr::New { args, .. } = expr {
         for arg in args {
-            replace_suspend_lambda_constructors(arg, related);
+            replace_suspend_lambda_constructors(arg, context);
         }
     }
 
@@ -2176,7 +2250,7 @@ fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
     } = expr
     {
         if class_name.contains("$$inlined$computedOn") {
-            if let Some(body) = decompile_computed_on_delegate(class_name, related) {
+            if let Some(body) = decompile_computed_on_delegate(class_name, context) {
                 if args.len() == 3 {
                     *expr = Expr::InvokeDynamic {
                         name: "computedOn".into(),
@@ -2194,10 +2268,10 @@ fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
             }
         }
 
-        if let Some(class) = related.iter().find(|class| class.this_class == *class_name) {
+        if let Some(class) = context.get(class_name) {
             if class.super_class.as_deref() == Some("kotlin/coroutines/jvm/internal/SuspendLambda")
             {
-                if let Some((body, capture_count)) = decompile_kotlin_suspend_lambda(class, related)
+                if let Some((body, capture_count)) = decompile_kotlin_suspend_lambda(class, context)
                 {
                     let captures = MethodDescriptor::parse(descriptor)
                         .ok()
@@ -2246,7 +2320,7 @@ fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
                 return;
             }
             if let Some((body, capture_count)) =
-                decompile_kotlin_anonymous_object(class, descriptor, related)
+                decompile_kotlin_anonymous_object(class, descriptor, context)
             {
                 if args.len() != capture_count {
                     return;
@@ -2274,65 +2348,65 @@ fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
 
     match expr {
         Expr::BinOp(_, left, right) => {
-            replace_suspend_lambda_constructors(left, related);
-            replace_suspend_lambda_constructors(right, related);
+            replace_suspend_lambda_constructors(left, context);
+            replace_suspend_lambda_constructors(right, context);
         }
         Expr::UnOp(_, value)
         | Expr::Cast(_, _, value)
         | Expr::InstanceOf(value, _)
         | Expr::ArrayLength(value)
-        | Expr::Throw(value) => replace_suspend_lambda_constructors(value, related),
+        | Expr::Throw(value) => replace_suspend_lambda_constructors(value, context),
         Expr::Ternary {
             cond,
             then_expr,
             else_expr,
         } => {
             if let crate::ir::TernaryCondition::Expression(cond) = cond {
-                replace_suspend_lambda_constructors(cond, related);
+                replace_suspend_lambda_constructors(cond, context);
             }
-            replace_suspend_lambda_constructors(then_expr, related);
-            replace_suspend_lambda_constructors(else_expr, related);
+            replace_suspend_lambda_constructors(then_expr, context);
+            replace_suspend_lambda_constructors(else_expr, context);
         }
         Expr::SwitchExpression { selector, arms } => {
-            replace_suspend_lambda_constructors(selector, related);
+            replace_suspend_lambda_constructors(selector, context);
             for (_, value) in arms {
-                replace_suspend_lambda_constructors(value, related);
+                replace_suspend_lambda_constructors(value, context);
             }
         }
         Expr::Field { object, value, .. } => {
             if let Some(object) = object {
-                replace_suspend_lambda_constructors(object, related);
+                replace_suspend_lambda_constructors(object, context);
             }
             if let Some(value) = value {
-                replace_suspend_lambda_constructors(value, related);
+                replace_suspend_lambda_constructors(value, context);
             }
         }
         Expr::Invoke { object, args, .. } => {
             if let Some(object) = object {
-                replace_suspend_lambda_constructors(object, related);
+                replace_suspend_lambda_constructors(object, context);
             }
             for arg in args {
-                replace_suspend_lambda_constructors(arg, related);
+                replace_suspend_lambda_constructors(arg, context);
             }
         }
         Expr::InvokeDynamic { args, .. } => {
             for arg in args {
-                replace_suspend_lambda_constructors(arg, related);
+                replace_suspend_lambda_constructors(arg, context);
             }
         }
         Expr::New { .. } => {}
         Expr::ArrayLoad { array, index, .. } => {
-            replace_suspend_lambda_constructors(array, related);
-            replace_suspend_lambda_constructors(index, related);
+            replace_suspend_lambda_constructors(array, context);
+            replace_suspend_lambda_constructors(index, context);
         }
         Expr::ArrayStore {
             array,
             index,
             value,
         } => {
-            replace_suspend_lambda_constructors(array, related);
-            replace_suspend_lambda_constructors(index, related);
-            replace_suspend_lambda_constructors(value, related);
+            replace_suspend_lambda_constructors(array, context);
+            replace_suspend_lambda_constructors(index, context);
+            replace_suspend_lambda_constructors(value, context);
         }
         Expr::NewArray {
             dimensions,
@@ -2340,20 +2414,20 @@ fn replace_suspend_lambda_constructors(expr: &mut Expr, related: &[ClassFile]) {
             ..
         } => {
             for dimension in dimensions {
-                replace_suspend_lambda_constructors(dimension, related);
+                replace_suspend_lambda_constructors(dimension, context);
             }
             if let Some(values) = initializer {
                 for value in values {
-                    replace_suspend_lambda_constructors(value, related);
+                    replace_suspend_lambda_constructors(value, context);
                 }
             }
         }
         Expr::Assign { lhs, rhs } => {
-            replace_suspend_lambda_constructors(lhs, related);
-            replace_suspend_lambda_constructors(rhs, related);
+            replace_suspend_lambda_constructors(lhs, context);
+            replace_suspend_lambda_constructors(rhs, context);
         }
-        Expr::Monitor { object, .. } => replace_suspend_lambda_constructors(object, related),
-        Expr::Return(Some(value)) => replace_suspend_lambda_constructors(value, related),
+        Expr::Monitor { object, .. } => replace_suspend_lambda_constructors(object, context),
+        Expr::Return(Some(value)) => replace_suspend_lambda_constructors(value, context),
         Expr::Const(_)
         | Expr::LocalVar(_)
         | Expr::Null
@@ -2399,7 +2473,7 @@ fn label_anonymous_outer_this(expr: Expr) -> Expr {
 fn decompile_kotlin_anonymous_object(
     class: &ClassFile,
     constructor_descriptor: &str,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> Option<(String, usize)> {
     let suffix = class.this_class.rsplit('$').next()?;
     if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
@@ -2436,7 +2510,7 @@ fn decompile_kotlin_anonymous_object(
     }
 
     let mut body = String::new();
-    render_class_body(&mut body, class, cls, None, related);
+    render_class_body(&mut body, class, cls, None, context);
     for (index, field) in class
         .fields
         .iter()
@@ -2564,11 +2638,12 @@ fn source_constructor_arguments<'a>(args: &'a [Expr], descriptor: &str) -> Vec<&
     last_required.map_or_else(Vec::new, |last| args[..=last].iter().collect())
 }
 
-fn decompile_computed_on_delegate(class_name: &str, related: &[ClassFile]) -> Option<String> {
+fn decompile_computed_on_delegate(
+    class_name: &str,
+    context: &KotlinGroupContext<'_>,
+) -> Option<String> {
     let consumer_name = format!("{class_name}$1");
-    let consumer = related
-        .iter()
-        .find(|class| class.this_class == consumer_name)?;
+    let consumer = context.get(&consumer_name)?;
     let method = consumer.methods.iter().find(|method| {
         method.name == "accept"
             && !method.is_bridge()

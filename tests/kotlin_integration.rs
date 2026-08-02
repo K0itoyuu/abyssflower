@@ -220,6 +220,25 @@ fn test_nested_and_synthetic_classes_are_consumed_by_host() {
     assert!(!units[0].source.contains("Synthetic class"));
 }
 
+#[test]
+fn parallel_group_rendering_is_deterministic() {
+    let paths = [
+        "tests/kotlin_classes/pkg/Counter.class",
+        "tests/kotlin_classes/pkg/Counter$Companion.class",
+        "tests/kotlin_classes/pkg/Result.class",
+        "tests/kotlin_classes/pkg/Result$Success.class",
+        "tests/kotlin_classes/pkg/Result$Loading.class",
+    ];
+    let classes = paths
+        .iter()
+        .map(|path| ClassFile::parse(&std::fs::read(path).unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    let expected = render_kotlin_group(&classes);
+    for _ in 0..8 {
+        assert_eq!(render_kotlin_group(&classes), expected);
+    }
+}
+
 // ── Extension functions and suspend ───────────────────────────────────────
 
 #[test]

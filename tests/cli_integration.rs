@@ -82,6 +82,62 @@ fn class_and_jar_entry_success_exit_with_code_0() {
 }
 
 #[test]
+fn complete_jar_requires_output_and_writes_sources() {
+    let jar = temp_jar();
+    let jar_str = jar.to_str().unwrap();
+    let missing_output = run(&["--java", "--jar", jar_str]);
+    assert_eq!(missing_output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_output.stderr).contains("--output is required"));
+
+    let output = std::env::temp_dir().join(format!(
+        "abyssflower-complete-jar-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = run(&[
+        "--java",
+        "--jar",
+        jar_str,
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{:?}", result.stderr);
+    assert!(output.join("fixture/ControlFlowFixture.java").is_file());
+
+    std::fs::remove_dir_all(output).unwrap();
+    std::fs::remove_file(jar).unwrap();
+}
+
+#[test]
+fn directory_input_requires_output_and_is_recursive() {
+    let missing_output = run(&["--java", "tests/java_classes"]);
+    assert_eq!(missing_output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing_output.stderr).contains("--output is required"));
+
+    let output = std::env::temp_dir().join(format!(
+        "abyssflower-directory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let result = run(&[
+        "--java",
+        "--output",
+        output.to_str().unwrap(),
+        "tests/java_classes",
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{:?}", result.stderr);
+    assert!(output.join("fixture/ControlFlowFixture.java").is_file());
+    assert!(output.join("fixture/WriterEdgeFixture.java").is_file());
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
 fn grouped_kotlin_input_merges_companion_output() {
     let output = std::env::temp_dir().join(format!(
         "abyssflower-kotlin-group-{}-{}",

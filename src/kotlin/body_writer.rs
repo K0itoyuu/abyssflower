@@ -18,6 +18,7 @@ use crate::ir::recovery::recover_with_branch_convergence;
 use crate::ir::stmt::*;
 use crate::ir::StmtArena;
 use crate::kotlin::types::{kotlin_class_name, kotlin_identifier};
+use crate::kotlin::writer::KotlinGroupContext;
 use crate::types::descriptor::MethodDescriptor;
 
 // ── Public entry point ────────────────────────────────────────────────────
@@ -345,7 +346,7 @@ fn decompile_kotlin_lambda_method(
 /// suspend-handler helpers, so they do not have a LambdaMetafactory bootstrap.
 pub(super) fn decompile_kotlin_suspend_lambda(
     class: &ClassFile,
-    related: &[ClassFile],
+    context: &KotlinGroupContext<'_>,
 ) -> Option<(String, usize)> {
     if class.super_class.as_deref() != Some("kotlin/coroutines/jvm/internal/SuspendLambda") {
         return None;
@@ -370,7 +371,7 @@ pub(super) fn decompile_kotlin_suspend_lambda(
             &format!("__abyss_capture_{index}"),
         );
     }
-    let body = replace_kotlin_function_object_constructors(body, related);
+    let body = replace_kotlin_function_object_constructors(body, context);
     if body.contains("opaque") || body.contains("TODO(") || body.contains("/*") {
         return None;
     }
@@ -551,16 +552,15 @@ pub(super) fn decompile_kotlin_function_object(class: &ClassFile) -> Option<(Str
     Some((lambda, capture_count))
 }
 
-fn replace_kotlin_function_object_constructors(mut body: String, related: &[ClassFile]) -> String {
+fn replace_kotlin_function_object_constructors(
+    mut body: String,
+    context: &KotlinGroupContext<'_>,
+) -> String {
     // A function object's body may recursively instantiate the same class.
     // Revisiting it would expand recursive source exponentially.
-    for class in related {
-        let Some((lambda, capture_count)) = decompile_kotlin_function_object(class) else {
-            continue;
-        };
-        let constructor = format!("{}(", kotlin_class_name(&class.this_class));
+    for (constructor, lambda, capture_count) in context.function_objects() {
         let (next, _) =
-            replace_balanced_constructor_calls(&body, &constructor, &lambda, capture_count);
+            replace_balanced_constructor_calls(&body, constructor, lambda, *capture_count);
         body = next;
     }
     body
