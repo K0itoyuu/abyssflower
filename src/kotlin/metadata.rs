@@ -3,7 +3,6 @@
 /// Implements enough of the kotlin.metadata protobuf schema to support decompilation
 /// of: data class, object, companion object, sealed class, enum class, extension functions,
 /// suspend functions, properties (val/var), nullability, type parameters.
-
 use super::protobuf::{self, ProtoReader, WireType};
 use crate::classfile::attribute::{Annotation, ElementValue};
 
@@ -23,6 +22,11 @@ pub enum MetadataKind {
 #[derive(Debug, Clone)]
 pub struct KotlinMetadata {
     pub kind: MetadataKind,
+    pub metadata_version: Vec<i32>,
+    pub extra_int: i32,
+    pub extra_string: Option<String>,
+    pub package_name: Option<String>,
+    pub multi_file_parts: Vec<String>,
     pub class: Option<KClass>,
     pub package: Option<KPackage>,
     pub lambda_function: Option<KFunction>,
@@ -58,7 +62,9 @@ pub enum ClassKind {
 pub struct KFlags(pub i32);
 
 impl KFlags {
-    pub fn has_annotations(self) -> bool { self.0 & 1 != 0 }
+    pub fn has_annotations(self) -> bool {
+        self.0 & 1 != 0
+    }
 
     pub fn visibility(self) -> Visibility {
         match (self.0 >> 1) & 0x07 {
@@ -96,12 +102,24 @@ impl KFlags {
     }
 
     // Class-specific flags (bits 9+)
-    pub fn is_inner_class(self) -> bool { (self.0 >> 9) & 1 != 0 }
-    pub fn is_data_class(self) -> bool { (self.0 >> 10) & 1 != 0 }
-    pub fn is_external_class(self) -> bool { (self.0 >> 11) & 1 != 0 }
-    pub fn is_expect_class(self) -> bool { (self.0 >> 12) & 1 != 0 }
-    pub fn is_value_class(self) -> bool { (self.0 >> 13) & 1 != 0 }
-    pub fn is_fun_interface(self) -> bool { (self.0 >> 14) & 1 != 0 }
+    pub fn is_inner_class(self) -> bool {
+        (self.0 >> 9) & 1 != 0
+    }
+    pub fn is_data_class(self) -> bool {
+        (self.0 >> 10) & 1 != 0
+    }
+    pub fn is_external_class(self) -> bool {
+        (self.0 >> 11) & 1 != 0
+    }
+    pub fn is_expect_class(self) -> bool {
+        (self.0 >> 12) & 1 != 0
+    }
+    pub fn is_value_class(self) -> bool {
+        (self.0 >> 13) & 1 != 0
+    }
+    pub fn is_fun_interface(self) -> bool {
+        (self.0 >> 14) & 1 != 0
+    }
 }
 
 /// Function flags layout:
@@ -142,13 +160,27 @@ impl KFunctionFlags {
         }
     }
 
-    pub fn is_operator(self) -> bool { (self.0 >> 8) & 1 != 0 }
-    pub fn is_infix(self) -> bool { (self.0 >> 9) & 1 != 0 }
-    pub fn is_inline(self) -> bool { (self.0 >> 10) & 1 != 0 }
-    pub fn is_tailrec(self) -> bool { (self.0 >> 11) & 1 != 0 }
-    pub fn is_external(self) -> bool { (self.0 >> 12) & 1 != 0 }
-    pub fn is_suspend(self) -> bool { (self.0 >> 13) & 1 != 0 }
-    pub fn is_expect(self) -> bool { (self.0 >> 14) & 1 != 0 }
+    pub fn is_operator(self) -> bool {
+        (self.0 >> 8) & 1 != 0
+    }
+    pub fn is_infix(self) -> bool {
+        (self.0 >> 9) & 1 != 0
+    }
+    pub fn is_inline(self) -> bool {
+        (self.0 >> 10) & 1 != 0
+    }
+    pub fn is_tailrec(self) -> bool {
+        (self.0 >> 11) & 1 != 0
+    }
+    pub fn is_external(self) -> bool {
+        (self.0 >> 12) & 1 != 0
+    }
+    pub fn is_suspend(self) -> bool {
+        (self.0 >> 13) & 1 != 0
+    }
+    pub fn is_expect(self) -> bool {
+        (self.0 >> 14) & 1 != 0
+    }
 }
 
 /// Property flags layout:
@@ -191,11 +223,21 @@ impl KPropertyFlags {
         }
     }
 
-    pub fn is_var(self) -> bool { (self.0 >> 8) & 1 != 0 }
-    pub fn is_const(self) -> bool { (self.0 >> 11) & 1 != 0 }
-    pub fn is_lateinit(self) -> bool { (self.0 >> 12) & 1 != 0 }
-    pub fn has_constant(self) -> bool { (self.0 >> 13) & 1 != 0 }
-    pub fn is_delegated(self) -> bool { (self.0 >> 15) & 1 != 0 }
+    pub fn is_var(self) -> bool {
+        (self.0 >> 8) & 1 != 0
+    }
+    pub fn is_const(self) -> bool {
+        (self.0 >> 11) & 1 != 0
+    }
+    pub fn is_lateinit(self) -> bool {
+        (self.0 >> 12) & 1 != 0
+    }
+    pub fn has_constant(self) -> bool {
+        (self.0 >> 13) & 1 != 0
+    }
+    pub fn is_delegated(self) -> bool {
+        (self.0 >> 15) & 1 != 0
+    }
 }
 
 /// Constructor flags:
@@ -218,7 +260,9 @@ impl KConstructorFlags {
         }
     }
 
-    pub fn is_secondary(self) -> bool { (self.0 >> 4) & 1 != 0 }
+    pub fn is_secondary(self) -> bool {
+        (self.0 >> 4) & 1 != 0
+    }
 }
 
 /// ValueParameter flags:
@@ -230,9 +274,15 @@ impl KConstructorFlags {
 pub struct KValueParamFlags(pub i32);
 
 impl KValueParamFlags {
-    pub fn declares_default_value(self) -> bool { (self.0 >> 1) & 1 != 0 }
-    pub fn is_crossinline(self) -> bool { (self.0 >> 2) & 1 != 0 }
-    pub fn is_noinline(self) -> bool { (self.0 >> 3) & 1 != 0 }
+    pub fn declares_default_value(self) -> bool {
+        (self.0 >> 1) & 1 != 0
+    }
+    pub fn is_crossinline(self) -> bool {
+        (self.0 >> 2) & 1 != 0
+    }
+    pub fn is_noinline(self) -> bool {
+        (self.0 >> 3) & 1 != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +334,7 @@ pub struct KFunction {
     pub receiver_type: Option<KType>,
     pub type_parameters: Vec<KTypeParameter>,
     pub value_parameters: Vec<KValueParameter>,
+    pub jvm_signature: Option<JvmMemberSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,12 +346,29 @@ pub struct KProperty {
     pub type_parameters: Vec<KTypeParameter>,
     pub getter_flags: i32,
     pub setter_flags: i32,
+    pub jvm_signature: Option<JvmPropertySignature>,
 }
 
 #[derive(Debug, Clone)]
 pub struct KConstructor {
     pub flags: KConstructorFlags,
     pub value_parameters: Vec<KValueParameter>,
+    pub jvm_signature: Option<JvmMemberSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmMemberSignature {
+    pub name: Option<String>,
+    pub descriptor: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JvmPropertySignature {
+    pub field: Option<JvmMemberSignature>,
+    pub synthetic_method: Option<JvmMemberSignature>,
+    pub getter: Option<JvmMemberSignature>,
+    pub setter: Option<JvmMemberSignature>,
+    pub delegate_method: Option<JvmMemberSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -367,21 +435,50 @@ pub struct KTypeTable {
 
 /// Predefined strings in Kotlin metadata (indices 0..43).
 const PREDEFINED: &[&str] = &[
-    "kotlin/Any", "kotlin/Nothing", "kotlin/Unit", "kotlin/Throwable", "kotlin/Number",
-    "kotlin/Byte", "kotlin/Double", "kotlin/Float", "kotlin/Int",
-    "kotlin/Long", "kotlin/Short", "kotlin/Boolean", "kotlin/Char",
-    "kotlin/CharSequence", "kotlin/String", "kotlin/Comparable", "kotlin/Enum",
-    "kotlin/Array", "kotlin/ByteArray", "kotlin/DoubleArray", "kotlin/FloatArray",
-    "kotlin/IntArray", "kotlin/LongArray", "kotlin/ShortArray", "kotlin/BooleanArray",
-    "kotlin/CharArray", "kotlin/Cloneable", "kotlin/Annotation",
-    "kotlin/collections/Iterable", "kotlin/collections/MutableIterable",
-    "kotlin/collections/Collection", "kotlin/collections/MutableCollection",
-    "kotlin/collections/List", "kotlin/collections/MutableList",
-    "kotlin/collections/Set", "kotlin/collections/MutableSet",
-    "kotlin/collections/Map", "kotlin/collections/MutableMap",
-    "kotlin/collections/Map.Entry", "kotlin/collections/MutableMap.MutableEntry",
-    "kotlin/collections/Iterator", "kotlin/collections/MutableIterator",
-    "kotlin/collections/ListIterator", "kotlin/collections/MutableListIterator",
+    "kotlin/Any",
+    "kotlin/Nothing",
+    "kotlin/Unit",
+    "kotlin/Throwable",
+    "kotlin/Number",
+    "kotlin/Byte",
+    "kotlin/Double",
+    "kotlin/Float",
+    "kotlin/Int",
+    "kotlin/Long",
+    "kotlin/Short",
+    "kotlin/Boolean",
+    "kotlin/Char",
+    "kotlin/CharSequence",
+    "kotlin/String",
+    "kotlin/Comparable",
+    "kotlin/Enum",
+    "kotlin/Array",
+    "kotlin/ByteArray",
+    "kotlin/DoubleArray",
+    "kotlin/FloatArray",
+    "kotlin/IntArray",
+    "kotlin/LongArray",
+    "kotlin/ShortArray",
+    "kotlin/BooleanArray",
+    "kotlin/CharArray",
+    "kotlin/Cloneable",
+    "kotlin/Annotation",
+    "kotlin/collections/Iterable",
+    "kotlin/collections/MutableIterable",
+    "kotlin/collections/Collection",
+    "kotlin/collections/MutableCollection",
+    "kotlin/collections/List",
+    "kotlin/collections/MutableList",
+    "kotlin/collections/Set",
+    "kotlin/collections/MutableSet",
+    "kotlin/collections/Map",
+    "kotlin/collections/MutableMap",
+    "kotlin/collections/Map.Entry",
+    "kotlin/collections/MutableMap.MutableEntry",
+    "kotlin/collections/Iterator",
+    "kotlin/collections/MutableIterator",
+    "kotlin/collections/ListIterator",
+    "kotlin/collections/MutableListIterator",
 ];
 
 /// StringTableTypes record — describes how to resolve each name index.
@@ -455,10 +552,12 @@ impl NameResolver {
             }
             // Operation
             match rec.operation {
-                1 => { // INTERNAL_TO_CLASS_ID
+                1 => {
+                    // INTERNAL_TO_CLASS_ID
                     s = s.replace('$', ".");
                 }
-                2 => { // DESC_TO_CLASS_ID
+                2 => {
+                    // DESC_TO_CLASS_ID
                     if s.len() >= 2 {
                         s = s[1..s.len() - 1].to_string(); // strip L...;
                     }
@@ -477,14 +576,20 @@ fn parse_string_table_types(data: &[u8]) -> Vec<StringRecord> {
     let mut records = Vec::new();
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (1, WireType::LengthDelimited) => {
                 // Record message
-                let Some(bytes) = reader.read_bytes() else { break };
+                let Some(bytes) = reader.read_bytes() else {
+                    break;
+                };
                 records.push(parse_string_record(bytes));
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -503,25 +608,39 @@ fn parse_string_record(data: &[u8]) -> StringRecord {
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { rec.range = reader.read_int32().unwrap_or(1); }
-            (2, WireType::Varint) => { rec.predefined_index = reader.read_int32(); }
-            (3, WireType::Varint) => { rec.operation = reader.read_int32().unwrap_or(0); }
+            (1, WireType::Varint) => {
+                rec.range = reader.read_int32().unwrap_or(1);
+            }
+            (2, WireType::Varint) => {
+                rec.predefined_index = reader.read_int32();
+            }
+            (3, WireType::Varint) => {
+                rec.operation = reader.read_int32().unwrap_or(0);
+            }
             (4, WireType::Varint) => {
-                if let Some(v) = reader.read_int32() { rec.substring_index.push(v); }
+                if let Some(v) = reader.read_int32() {
+                    rec.substring_index.push(v);
+                }
             }
             (4, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    rec.substring_index.extend(ProtoReader::read_packed_int32(bytes));
+                    rec.substring_index
+                        .extend(ProtoReader::read_packed_int32(bytes));
                 }
             }
             (5, WireType::Varint) => {
-                if let Some(v) = reader.read_int32() { rec.replace_char.push(v); }
+                if let Some(v) = reader.read_int32() {
+                    rec.replace_char.push(v);
+                }
             }
             (5, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    rec.replace_char.extend(ProtoReader::read_packed_int32(bytes));
+                    rec.replace_char
+                        .extend(ProtoReader::read_packed_int32(bytes));
                 }
             }
             (6, WireType::LengthDelimited) => {
@@ -529,7 +648,9 @@ fn parse_string_record(data: &[u8]) -> StringRecord {
                     rec.string = Some(String::from_utf8_lossy(bytes).to_string());
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -550,24 +671,57 @@ pub fn parse_kotlin_metadata(annotations: &[Annotation]) -> Option<KotlinMetadat
     let mut k: i32 = 1;
     let mut d1: Vec<String> = Vec::new();
     let mut d2: Vec<String> = Vec::new();
+    let mut metadata_version = Vec::new();
+    let mut extra_int = 0;
+    let mut extra_string = None;
+    let mut package_name = None;
 
     for (name, value) in &meta_ann.elements {
         match name.as_str() {
             "k" => {
-                if let ElementValue::Int(v) = value { k = *v; }
+                if let ElementValue::Int(v) = value {
+                    k = *v;
+                }
             }
             "d1" => {
                 if let ElementValue::Array(arr) = value {
                     for ev in arr {
-                        if let ElementValue::String(s) = ev { d1.push(s.clone()); }
+                        if let ElementValue::String(s) = ev {
+                            d1.push(s.clone());
+                        }
                     }
                 }
             }
             "d2" => {
                 if let ElementValue::Array(arr) = value {
                     for ev in arr {
-                        if let ElementValue::String(s) = ev { d2.push(s.clone()); }
+                        if let ElementValue::String(s) = ev {
+                            d2.push(s.clone());
+                        }
                     }
+                }
+            }
+            "mv" => {
+                if let ElementValue::Array(values) = value {
+                    metadata_version.extend(values.iter().filter_map(|value| match value {
+                        ElementValue::Int(value) => Some(*value),
+                        _ => None,
+                    }));
+                }
+            }
+            "xi" => {
+                if let ElementValue::Int(value) = value {
+                    extra_int = *value;
+                }
+            }
+            "xs" => {
+                if let ElementValue::String(value) = value {
+                    extra_string = Some(value.clone());
+                }
+            }
+            "pn" => {
+                if let ElementValue::String(value) = value {
+                    package_name = Some(value.clone());
                 }
             }
             _ => {}
@@ -586,7 +740,21 @@ pub fn parse_kotlin_metadata(annotations: &[Annotation]) -> Option<KotlinMetadat
     // Decode d1 → raw protobuf bytes
     let raw_bytes = protobuf::decode_bit_encoding(&d1);
     if raw_bytes.is_empty() {
-        return Some(KotlinMetadata { kind, class: None, package: None, lambda_function: None });
+        return Some(KotlinMetadata {
+            kind,
+            metadata_version,
+            extra_int,
+            extra_string,
+            package_name,
+            multi_file_parts: if kind == MetadataKind::MultiFileFacade {
+                d1.clone()
+            } else {
+                Vec::new()
+            },
+            class: None,
+            package: None,
+            lambda_function: None,
+        });
     }
 
     // Parse StringTableTypes (length-delimited at the start)
@@ -616,7 +784,21 @@ pub fn parse_kotlin_metadata(annotations: &[Annotation]) -> Option<KotlinMetadat
         }
     }
 
-    Some(KotlinMetadata { kind, class, package, lambda_function })
+    Some(KotlinMetadata {
+        kind,
+        metadata_version,
+        extra_int,
+        extra_string,
+        package_name,
+        multi_file_parts: if kind == MetadataKind::MultiFileFacade {
+            d1
+        } else {
+            Vec::new()
+        },
+        class,
+        package,
+        lambda_function,
+    })
 }
 
 // ── Class parsing ─────────────────────────────────────────────────────────
@@ -639,9 +821,13 @@ fn parse_class(data: &[u8], resolver: &NameResolver) -> KClass {
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { cls.flags = KFlags(reader.read_int32().unwrap_or(6)); }
+            (1, WireType::Varint) => {
+                cls.flags = KFlags(reader.read_int32().unwrap_or(6));
+            }
             (3, WireType::Varint) => {
                 cls.fq_name = reader.read_int32().map(|i| resolver.resolve(i));
             }
@@ -650,7 +836,8 @@ fn parse_class(data: &[u8], resolver: &NameResolver) -> KClass {
             }
             (5, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    cls.type_parameters.push(parse_type_parameter(bytes, resolver));
+                    cls.type_parameters
+                        .push(parse_type_parameter(bytes, resolver));
                 }
             }
             (6, WireType::LengthDelimited) => {
@@ -693,7 +880,9 @@ fn parse_class(data: &[u8], resolver: &NameResolver) -> KClass {
                     cls.type_table = Some(parse_type_table(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -711,7 +900,9 @@ fn parse_package(data: &[u8], resolver: &NameResolver) -> KPackage {
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (3, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
@@ -728,7 +919,9 @@ fn parse_package(data: &[u8], resolver: &NameResolver) -> KPackage {
                     pkg.type_table = Some(parse_type_table(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -761,11 +954,14 @@ fn parse_function(data: &[u8], resolver: &NameResolver) -> KFunction {
         receiver_type: None,
         type_parameters: Vec::new(),
         value_parameters: Vec::new(),
+        jvm_signature: None,
     };
     let mut has_flags = false;
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (9, WireType::Varint) => {
                 func.flags = KFunctionFlags(reader.read_int32().unwrap_or(6));
@@ -781,7 +977,10 @@ fn parse_function(data: &[u8], resolver: &NameResolver) -> KFunction {
                 }
             }
             (2, WireType::Varint) => {
-                func.name = reader.read_int32().map(|i| resolver.resolve(i)).unwrap_or_default();
+                func.name = reader
+                    .read_int32()
+                    .map(|i| resolver.resolve(i))
+                    .unwrap_or_default();
             }
             (3, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
@@ -790,7 +989,8 @@ fn parse_function(data: &[u8], resolver: &NameResolver) -> KFunction {
             }
             (4, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    func.type_parameters.push(parse_type_parameter(bytes, resolver));
+                    func.type_parameters
+                        .push(parse_type_parameter(bytes, resolver));
                 }
             }
             (5, WireType::LengthDelimited) => {
@@ -800,10 +1000,18 @@ fn parse_function(data: &[u8], resolver: &NameResolver) -> KFunction {
             }
             (6, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    func.value_parameters.push(parse_value_parameter(bytes, resolver));
+                    func.value_parameters
+                        .push(parse_value_parameter(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            (100, WireType::LengthDelimited) => {
+                if let Some(bytes) = reader.read_bytes() {
+                    func.jvm_signature = Some(parse_jvm_member_signature(bytes, resolver));
+                }
+            }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -822,11 +1030,14 @@ fn parse_property(data: &[u8], resolver: &NameResolver) -> KProperty {
         type_parameters: Vec::new(),
         getter_flags: 0,
         setter_flags: 0,
+        jvm_signature: None,
     };
     let mut has_flags = false;
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (11, WireType::Varint) => {
                 prop.flags = KPropertyFlags(reader.read_int32().unwrap_or(6));
@@ -841,7 +1052,10 @@ fn parse_property(data: &[u8], resolver: &NameResolver) -> KProperty {
                 }
             }
             (2, WireType::Varint) => {
-                prop.name = reader.read_int32().map(|i| resolver.resolve(i)).unwrap_or_default();
+                prop.name = reader
+                    .read_int32()
+                    .map(|i| resolver.resolve(i))
+                    .unwrap_or_default();
             }
             (3, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
@@ -850,7 +1064,8 @@ fn parse_property(data: &[u8], resolver: &NameResolver) -> KProperty {
             }
             (4, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    prop.type_parameters.push(parse_type_parameter(bytes, resolver));
+                    prop.type_parameters
+                        .push(parse_type_parameter(bytes, resolver));
                 }
             }
             (5, WireType::LengthDelimited) => {
@@ -858,9 +1073,20 @@ fn parse_property(data: &[u8], resolver: &NameResolver) -> KProperty {
                     prop.receiver_type = Some(parse_type(bytes, resolver));
                 }
             }
-            (7, WireType::Varint) => { prop.getter_flags = reader.read_int32().unwrap_or(0); }
-            (8, WireType::Varint) => { prop.setter_flags = reader.read_int32().unwrap_or(0); }
-            _ => { reader.skip(wt); }
+            (7, WireType::Varint) => {
+                prop.getter_flags = reader.read_int32().unwrap_or(0);
+            }
+            (8, WireType::Varint) => {
+                prop.setter_flags = reader.read_int32().unwrap_or(0);
+            }
+            (100, WireType::LengthDelimited) => {
+                if let Some(bytes) = reader.read_bytes() {
+                    prop.jvm_signature = Some(parse_jvm_property_signature(bytes, resolver));
+                }
+            }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -874,22 +1100,87 @@ fn parse_constructor(data: &[u8], resolver: &NameResolver) -> KConstructor {
     let mut ctor = KConstructor {
         flags: KConstructorFlags(6),
         value_parameters: Vec::new(),
+        jvm_signature: None,
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { ctor.flags = KConstructorFlags(reader.read_int32().unwrap_or(6)); }
+            (1, WireType::Varint) => {
+                ctor.flags = KConstructorFlags(reader.read_int32().unwrap_or(6));
+            }
             (2, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
-                    ctor.value_parameters.push(parse_value_parameter(bytes, resolver));
+                    ctor.value_parameters
+                        .push(parse_value_parameter(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            (100, WireType::LengthDelimited) => {
+                if let Some(bytes) = reader.read_bytes() {
+                    ctor.jvm_signature = Some(parse_jvm_member_signature(bytes, resolver));
+                }
+            }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
     ctor
+}
+
+fn parse_jvm_member_signature(data: &[u8], resolver: &NameResolver) -> JvmMemberSignature {
+    let mut reader = ProtoReader::new(data);
+    let mut signature = JvmMemberSignature {
+        name: None,
+        descriptor: None,
+    };
+    while !reader.is_empty() {
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
+        match (field, wt) {
+            (1, WireType::Varint) => {
+                signature.name = reader.read_int32().map(|i| resolver.resolve(i));
+            }
+            (2, WireType::Varint) => {
+                signature.descriptor = reader.read_int32().map(|i| resolver.resolve(i));
+            }
+            _ => {
+                reader.skip(wt);
+            }
+        }
+    }
+    signature
+}
+
+fn parse_jvm_property_signature(data: &[u8], resolver: &NameResolver) -> JvmPropertySignature {
+    let mut reader = ProtoReader::new(data);
+    let mut signature = JvmPropertySignature::default();
+    while !reader.is_empty() {
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
+        if wt != WireType::LengthDelimited {
+            reader.skip(wt);
+            continue;
+        }
+        let Some(bytes) = reader.read_bytes() else {
+            break;
+        };
+        let member = Some(parse_jvm_member_signature(bytes, resolver));
+        match field {
+            1 => signature.field = member,
+            2 => signature.synthetic_method = member,
+            3 => signature.getter = member,
+            4 => signature.setter = member,
+            5 => signature.delegate_method = member,
+            _ => {}
+        }
+    }
+    signature
 }
 
 // ── ValueParameter parsing ────────────────────────────────────────────────
@@ -904,11 +1195,18 @@ fn parse_value_parameter(data: &[u8], resolver: &NameResolver) -> KValueParamete
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { vp.flags = KValueParamFlags(reader.read_int32().unwrap_or(0)); }
+            (1, WireType::Varint) => {
+                vp.flags = KValueParamFlags(reader.read_int32().unwrap_or(0));
+            }
             (2, WireType::Varint) => {
-                vp.name = reader.read_int32().map(|i| resolver.resolve(i)).unwrap_or_default();
+                vp.name = reader
+                    .read_int32()
+                    .map(|i| resolver.resolve(i))
+                    .unwrap_or_default();
             }
             (3, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
@@ -920,7 +1218,9 @@ fn parse_value_parameter(data: &[u8], resolver: &NameResolver) -> KValueParamete
                     vp.vararg_element_type = Some(parse_type(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -940,13 +1240,22 @@ fn parse_type_parameter(data: &[u8], resolver: &NameResolver) -> KTypeParameter 
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { tp.id = reader.read_int32().unwrap_or(0); }
-            (2, WireType::Varint) => {
-                tp.name = reader.read_int32().map(|i| resolver.resolve(i)).unwrap_or_default();
+            (1, WireType::Varint) => {
+                tp.id = reader.read_int32().unwrap_or(0);
             }
-            (3, WireType::Varint) => { tp.reified = reader.read_bool().unwrap_or(false); }
+            (2, WireType::Varint) => {
+                tp.name = reader
+                    .read_int32()
+                    .map(|i| resolver.resolve(i))
+                    .unwrap_or_default();
+            }
+            (3, WireType::Varint) => {
+                tp.reified = reader.read_bool().unwrap_or(false);
+            }
             (4, WireType::Varint) => {
                 tp.variance = match reader.read_int32().unwrap_or(2) {
                     0 => Variance::In,
@@ -959,7 +1268,9 @@ fn parse_type_parameter(data: &[u8], resolver: &NameResolver) -> KTypeParameter 
                     tp.upper_bounds.push(parse_type(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -982,15 +1293,21 @@ fn parse_type(data: &[u8], resolver: &NameResolver) -> KType {
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
-            (1, WireType::Varint) => { ty.flags = KFlags(reader.read_int32().unwrap_or(0)); }
+            (1, WireType::Varint) => {
+                ty.flags = KFlags(reader.read_int32().unwrap_or(0));
+            }
             (2, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
                     ty.arguments.push(parse_type_argument(bytes, resolver));
                 }
             }
-            (3, WireType::Varint) => { ty.nullable = reader.read_bool().unwrap_or(false); }
+            (3, WireType::Varint) => {
+                ty.nullable = reader.read_bool().unwrap_or(false);
+            }
             (6, WireType::Varint) => {
                 ty.class_name = reader.read_int32().map(|i| resolver.resolve(i));
             }
@@ -1005,12 +1322,21 @@ fn parse_type(data: &[u8], resolver: &NameResolver) -> KType {
                     ty.outer_type = Some(Box::new(parse_type(bytes, resolver)));
                 }
             }
+            (12, WireType::Varint) => {
+                // ProtoBuf.Type.typeAliasName.  Type aliases still need their
+                // source-level name when rendered; treating them as unnamed
+                // types degrades aliases such as kotlin.collections.RandomAccess
+                // to Any.
+                ty.class_name = reader.read_int32().map(|i| resolver.resolve(i));
+            }
             (13, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
                     ty.abbreviated_type = Some(Box::new(parse_type(bytes, resolver)));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -1027,7 +1353,9 @@ fn parse_type_argument(data: &[u8], resolver: &NameResolver) -> KTypeArgument {
     };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (1, WireType::Varint) => {
                 arg.projection = match reader.read_int32().unwrap_or(2) {
@@ -1043,7 +1371,9 @@ fn parse_type_argument(data: &[u8], resolver: &NameResolver) -> KTypeArgument {
                     arg.type_ = Some(parse_type(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -1054,15 +1384,24 @@ fn parse_type_argument(data: &[u8], resolver: &NameResolver) -> KTypeArgument {
 
 fn parse_enum_entry(data: &[u8], resolver: &NameResolver) -> KEnumEntry {
     let mut reader = ProtoReader::new(data);
-    let mut entry = KEnumEntry { name: String::new() };
+    let mut entry = KEnumEntry {
+        name: String::new(),
+    };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (1, WireType::Varint) => {
-                entry.name = reader.read_int32().map(|i| resolver.resolve(i)).unwrap_or_default();
+                entry.name = reader
+                    .read_int32()
+                    .map(|i| resolver.resolve(i))
+                    .unwrap_or_default();
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
@@ -1076,16 +1415,35 @@ fn parse_type_table(data: &[u8], resolver: &NameResolver) -> KTypeTable {
     let mut table = KTypeTable { types: Vec::new() };
 
     while !reader.is_empty() {
-        let Some((field, wt)) = reader.read_tag() else { break };
+        let Some((field, wt)) = reader.read_tag() else {
+            break;
+        };
         match (field, wt) {
             (1, WireType::LengthDelimited) => {
                 if let Some(bytes) = reader.read_bytes() {
                     table.types.push(parse_type(bytes, resolver));
                 }
             }
-            _ => { reader.skip(wt); }
+            _ => {
+                reader.skip(wt);
+            }
         }
     }
 
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_type, NameResolver};
+
+    #[test]
+    fn type_alias_name_is_preserved_as_a_renderable_type() {
+        let resolver = NameResolver::new(&[], vec!["kotlin/collections/RandomAccess".into()]);
+        let ty = parse_type(&[0x60, 0x00], &resolver);
+        assert_eq!(
+            ty.class_name.as_deref(),
+            Some("kotlin/collections/RandomAccess")
+        );
+    }
 }

@@ -12,30 +12,59 @@ pub type ExprId = u32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     // arithmetic
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     // bitwise
-    And, Or, Xor,
+    And,
+    Or,
+    Xor,
     // shifts
-    Shl, Shr, Ushr,
+    Shl,
+    Shr,
+    Ushr,
     // comparisons (produce int/boolean)
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
     // long/float comparisons (raw, need context to negate)
-    LCmp, FCmpL, FCmpG, DCmpL, DCmpG,
+    LCmp,
+    FCmpL,
+    FCmpG,
+    DCmpL,
+    DCmpG,
 }
 
 impl BinOp {
     pub fn symbol(self) -> &'static str {
         match self {
-            BinOp::Add  => "+",  BinOp::Sub  => "-",
-            BinOp::Mul  => "*",  BinOp::Div  => "/",  BinOp::Rem  => "%",
-            BinOp::And  => "&",  BinOp::Or   => "|",  BinOp::Xor  => "^",
-            BinOp::Shl  => "<<", BinOp::Shr  => ">>", BinOp::Ushr => ">>>",
-            BinOp::Eq   => "==", BinOp::Ne   => "!=",
-            BinOp::Lt   => "<",  BinOp::Le   => "<=",
-            BinOp::Gt   => ">",  BinOp::Ge   => ">=",
-            BinOp::LCmp  => "/*lcmp*/",
-            BinOp::FCmpL => "/*fcmpl*/", BinOp::FCmpG => "/*fcmpg*/",
-            BinOp::DCmpL => "/*dcmpl*/", BinOp::DCmpG => "/*dcmpg*/",
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Rem => "%",
+            BinOp::And => "&",
+            BinOp::Or => "|",
+            BinOp::Xor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Ushr => ">>>",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::LCmp => "/*lcmp*/",
+            BinOp::FCmpL => "/*fcmpl*/",
+            BinOp::FCmpG => "/*fcmpg*/",
+            BinOp::DCmpL => "/*dcmpl*/",
+            BinOp::DCmpG => "/*dcmpg*/",
         }
     }
 
@@ -49,7 +78,7 @@ impl BinOp {
             BinOp::Eq | BinOp::Ne => 7,
             BinOp::And => 8,
             BinOp::Xor => 9,
-            BinOp::Or  => 10,
+            BinOp::Or => 10,
             _ => 0,
         }
     }
@@ -66,9 +95,9 @@ pub enum UnOp {
 impl UnOp {
     pub fn symbol(self) -> &'static str {
         match self {
-            UnOp::Neg    => "-",
+            UnOp::Neg => "-",
             UnOp::BitNot => "~",
-            UnOp::BoolNot=> "!",
+            UnOp::BoolNot => "!",
         }
     }
 }
@@ -76,12 +105,22 @@ impl UnOp {
 // ── CastKind ──────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CastKind {
-    I2L, I2F, I2D,
-    L2I, L2F, L2D,
-    F2I, F2L, F2D,
-    D2I, D2L, D2F,
-    I2B, I2C, I2S,
-    CheckCast,   // (SomeClass) expr
+    I2L,
+    I2F,
+    I2D,
+    L2I,
+    L2F,
+    L2D,
+    F2I,
+    F2L,
+    F2D,
+    D2I,
+    D2L,
+    D2F,
+    I2B,
+    I2C,
+    I2S,
+    CheckCast, // (SomeClass) expr
 }
 
 // ── InvokeKind ────────────────────────────────────────────────────────────
@@ -94,17 +133,51 @@ pub enum InvokeKind {
     Dynamic,
 }
 
+/// Source-level form recovered from a LambdaMetafactory bootstrap method.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LambdaBootstrap {
+    /// A synthetic `lambda$...` implementation rendered as a lambda expression.
+    Lambda(String),
+    /// A Kotlin synthetic implementation whose leading JVM parameters are
+    /// captures supplied by the invokedynamic call site.
+    KotlinLambda { body: String, capture_count: usize },
+    /// A direct method/constructor reference. The call-site arguments contain
+    /// the receiver for bound instance references.
+    MethodReference {
+        reference_kind: u8,
+        owner: String,
+        name: String,
+        descriptor: String,
+        sam_parameter_count: usize,
+    },
+}
+
 // ── FieldAccess ───────────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FieldDir { Get, Put }
+pub enum FieldDir {
+    Get,
+    Put,
+}
 
 // ── NewKind ───────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub enum NewKind {
-    Object,                     // new Foo(...)
-    PrimitiveArray { atype: u8 },  // new int[n]
-    RefArray,                   // new Foo[n]
-    MultiArray { dims: u8 },    // new Foo[a][b][c]
+    Object,                       // new Foo(...)
+    PrimitiveArray { atype: u8 }, // new int[n]
+    RefArray,                     // new Foo[n]
+    MultiArray { dims: u8 },      // new Foo[a][b][c]
+}
+
+#[derive(Debug, Clone)]
+pub enum TernaryCondition {
+    Rendered(String),
+    Expression(Box<Expr>),
+}
+
+impl From<String> for TernaryCondition {
+    fn from(value: String) -> Self {
+        Self::Rendered(value)
+    }
 }
 
 // ── Expr ──────────────────────────────────────────────────────────────────
@@ -123,7 +196,7 @@ pub enum Expr {
     /// `null` literal.
     Null,
     /// `this` reference (slot 0 in instance methods).
-    This(String),   // binary class name
+    This(String), // binary class name
 
     // ── arithmetic / logical ──────────────────────────────────────────
     BinOp(BinOp, Box<Expr>, Box<Expr>),
@@ -140,56 +213,65 @@ pub enum Expr {
     /// expression layer no longer has access to by the time the two arms
     /// have been folded together.
     Ternary {
-        cond:      String,
+        cond: TernaryCondition,
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
+    },
+    /// A value-producing JVM tableswitch/lookupswitch.
+    SwitchExpression {
+        selector: Box<Expr>,
+        arms: Vec<(Option<i32>, Expr)>,
     },
 
     // ── field access ──────────────────────────────────────────────────
     Field {
-        dir:        FieldDir,
-        owner:      String,       // binary class name
-        name:       String,
+        dir: FieldDir,
+        owner: String, // binary class name
+        name: String,
         descriptor: String,
         /// `None` for static fields.
-        object:     Option<Box<Expr>>,
-        value:      Option<Box<Expr>>,  // only for Put
+        object: Option<Box<Expr>>,
+        value: Option<Box<Expr>>, // only for Put
     },
 
     // ── method invocation ─────────────────────────────────────────────
     Invoke {
-        kind:       InvokeKind,
-        owner:      String,
-        name:       String,
+        kind: InvokeKind,
+        owner: String,
+        name: String,
         descriptor: String,
         /// `None` for static calls.
-        object:     Option<Box<Expr>>,
-        args:       Vec<Expr>,
+        object: Option<Box<Expr>>,
+        args: Vec<Expr>,
     },
 
     // ── invokedynamic ─────────────────────────────────────────────────
     InvokeDynamic {
-        name:       String,
+        name: String,
         descriptor: String,
         bootstrap_index: u16,
-        args:       Vec<Expr>,
+        args: Vec<Expr>,
+        /// Resolved StringConcatFactory recipe, when this call site uses one.
+        concat_recipe: Option<String>,
+        /// Source form resolved from LambdaMetafactory metadata.
+        lambda_body: Option<LambdaBootstrap>,
     },
 
     // ── array operations ──────────────────────────────────────────────
     ArrayLoad {
-        array:      Box<Expr>,
-        index:      Box<Expr>,
-        elem_type:  JavaType,
+        array: Box<Expr>,
+        index: Box<Expr>,
+        elem_type: JavaType,
     },
     ArrayStore {
-        array:      Box<Expr>,
-        index:      Box<Expr>,
-        value:      Box<Expr>,
+        array: Box<Expr>,
+        index: Box<Expr>,
+        value: Box<Expr>,
     },
     ArrayLength(Box<Expr>),
     NewArray {
-        kind:       NewKind,
-        type_:      JavaType,
+        kind: NewKind,
+        type_: JavaType,
         dimensions: Vec<Expr>,
         /// Element values when the array is built with an inline initializer,
         /// i.e. `new Foo[]{a, b, c}`.  javac compiles that (and every varargs
@@ -202,7 +284,7 @@ pub enum Expr {
     // ── object creation ───────────────────────────────────────────────
     New {
         class_name: String,
-        args:       Vec<Expr>,
+        args: Vec<Expr>,
         descriptor: String,
     },
 
@@ -214,16 +296,26 @@ pub enum Expr {
 
     // ── stack / control helpers ───────────────────────────────────────
     /// iinc implemented as compound assignment: local += const
-    IInc { slot: u16, delta: i16, name: Option<String> },
+    IInc {
+        slot: u16,
+        delta: i16,
+        name: Option<String>,
+    },
     /// monitorenter / monitorexit
-    Monitor { enter: bool, object: Box<Expr> },
+    Monitor {
+        enter: bool,
+        object: Box<Expr>,
+    },
     /// athrow
     Throw(Box<Expr>),
     /// ireturn / lreturn / freturn / dreturn / areturn / return
     Return(Option<Box<Expr>>),
 
     /// Placeholder for an expression that couldn't be lifted.
-    Opaque { opcode: u8, offset: u32 },
+    Opaque {
+        opcode: u8,
+        offset: u32,
+    },
 }
 
 impl Expr {
@@ -235,7 +327,7 @@ impl Expr {
             Expr::BinOp(op, _, _) => op.precedence(),
             Expr::Cast(_, _, _) => 1,
             Expr::InstanceOf(_, _) => 6,
-            Expr::Ternary { .. } => 13,
+            Expr::Ternary { .. } | Expr::SwitchExpression { .. } => 13,
             Expr::Invoke { .. } | Expr::Field { .. } => 0,
             Expr::New { .. } | Expr::NewArray { .. } => 0,
             Expr::Assign { .. } => 14,
@@ -245,13 +337,22 @@ impl Expr {
 
     /// True if this expression has side effects (relevant for emission order).
     pub fn has_side_effects(&self) -> bool {
-        matches!(self,
-            Expr::Invoke { .. } | Expr::InvokeDynamic { .. } |
-            Expr::New { .. }    | Expr::NewArray { .. } |
-            Expr::Field { dir: FieldDir::Put, .. } |
-            Expr::ArrayStore { .. } | Expr::Assign { .. } |
-            Expr::IInc { .. }  | Expr::Monitor { .. } |
-            Expr::Throw(_)     | Expr::Return(_)
+        matches!(
+            self,
+            Expr::Invoke { .. }
+                | Expr::InvokeDynamic { .. }
+                | Expr::New { .. }
+                | Expr::NewArray { .. }
+                | Expr::Field {
+                    dir: FieldDir::Put,
+                    ..
+                }
+                | Expr::ArrayStore { .. }
+                | Expr::Assign { .. }
+                | Expr::IInc { .. }
+                | Expr::Monitor { .. }
+                | Expr::Throw(_)
+                | Expr::Return(_)
         )
     }
 }
@@ -261,7 +362,7 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct ConstExpr {
     pub value: ConstValue,
-    pub ty:    JavaType,
+    pub ty: JavaType,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +372,7 @@ pub enum ConstValue {
     Float(f32),
     Double(f64),
     StringRef(String),
-    ClassRef(String),    // "Foo.class"
+    ClassRef(String), // "Foo.class"
     Null,
 }
 
@@ -280,9 +381,9 @@ pub enum ConstValue {
 #[derive(Debug, Clone)]
 pub struct LocalVarExpr {
     /// JVM local-variable slot index.
-    pub slot:    u16,
+    pub slot: u16,
     /// Inferred or declared type.
-    pub ty:      JavaType,
+    pub ty: JavaType,
     /// Debug name from LocalVariableTable, if available.
-    pub name:    Option<String>,
+    pub name: Option<String>,
 }

@@ -68,7 +68,9 @@ impl<'a> Cursor<'a> {
     #[inline]
     pub fn read_i64(&mut self) -> Result<i64> {
         let b = self.read_bytes(8)?;
-        Ok(i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(i64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     #[inline]

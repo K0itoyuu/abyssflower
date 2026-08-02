@@ -1,6 +1,6 @@
 [package]
 name = "abyssflower"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A high-performance JVM bytecode decompiler written in Rust, with first-class Kotlin support"
 license = "Apache-2.0"
@@ -22,11 +22,13 @@ thiserror  = "1.0.69"
 bitflags   = "2.6.0"
 indexmap   = "2.7.0"
 zip        = { version = "2", default-features = false, features = ["deflate"] }
+clap       = { version = "=4.5.47", features = ["derive"] }
 rmcp       = { version = "3.0.0-beta", features = ["server", "transport-io", "schemars"], optional = true }
 schemars   = { version = "1", optional = true }
 serde      = { version = "1", features = ["derive"], optional = true }
 tokio      = { version = "1", features = ["rt-multi-thread", "macros", "io-std"], optional = true }
 base64     = { version = "0.22", optional = true }
+cap-std    = "4.0.2"
 
 [features]
 default = ["mcp"]

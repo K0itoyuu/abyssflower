@@ -7,7 +7,7 @@ use crate::cfg::block::{BasicBlock, BlockId, ExceptionRange, ENTRY_BLOCK, EXIT_B
 #[derive(Debug)]
 pub struct Cfg {
     /// All blocks in build order.  ENTRY = index 0, EXIT = last.
-    pub blocks:           Vec<BasicBlock>,
+    pub blocks: Vec<BasicBlock>,
     /// Exception ranges attached to this method.
     pub exception_ranges: Vec<ExceptionRange>,
 }
@@ -27,17 +27,25 @@ impl Cfg {
     // ── block lookup ───────────────────────────────────────────────────
 
     pub fn block(&self, id: BlockId) -> &BasicBlock {
-        self.blocks.iter().find(|b| b.id == id)
+        self.blocks
+            .iter()
+            .find(|b| b.id == id)
             .expect("BlockId not found in CFG")
     }
 
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
-        self.blocks.iter_mut().find(|b| b.id == id)
+        self.blocks
+            .iter_mut()
+            .find(|b| b.id == id)
             .expect("BlockId not found in CFG")
     }
 
-    pub fn entry(&self) -> &BasicBlock { self.block(ENTRY_BLOCK) }
-    pub fn exit(&self)  -> &BasicBlock { self.block(EXIT_BLOCK)  }
+    pub fn entry(&self) -> &BasicBlock {
+        self.block(ENTRY_BLOCK)
+    }
+    pub fn exit(&self) -> &BasicBlock {
+        self.block(EXIT_BLOCK)
+    }
 
     /// All non-synthetic (real) blocks.
     pub fn real_blocks(&self) -> impl Iterator<Item = &BasicBlock> {
@@ -45,7 +53,13 @@ impl Cfg {
     }
 
     /// Total number of blocks including synthetic ones.
-    pub fn len(&self) -> usize { self.blocks.len() }
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.real_blocks().next().is_none()
+    }
 
     // ── graph traversal ────────────────────────────────────────────────
 
@@ -65,7 +79,9 @@ impl Cfg {
         visited: &mut std::collections::HashSet<BlockId>,
         out: &mut Vec<BlockId>,
     ) {
-        if !visited.insert(id) { return; }
+        if !visited.insert(id) {
+            return;
+        }
         let block = self.block(id);
         // Visit regular successors then exception successors
         for &succ in &block.succs {
@@ -80,7 +96,8 @@ impl Cfg {
     // ── statistics ─────────────────────────────────────────────────────
 
     pub fn edge_count(&self) -> usize {
-        self.blocks.iter()
+        self.blocks
+            .iter()
             .map(|b| b.succs.len() + b.succ_exceptions.len())
             .sum()
     }
@@ -101,7 +118,9 @@ impl Cfg {
             } else {
                 out.push_str(&format!(
                     "Block {} [pc {:#x}..{:#x}] ({} insns)\n",
-                    block.id, block.start_offset, block.end_offset,
+                    block.id,
+                    block.start_offset,
+                    block.end_offset,
                     block.instructions.len()
                 ));
                 for insn in &block.instructions {

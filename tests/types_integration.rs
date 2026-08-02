@@ -95,7 +95,13 @@ mod signature_tests {
         assert_eq!(ms.params.len(), 1);
         if let GenericType::Class { args, .. } = &ms.params[0] {
             assert_eq!(args.len(), 1);
-            assert!(matches!(&args[0], TypeArg::Bounded { wildcard: Wildcard::Extends, .. }));
+            assert!(matches!(
+                &args[0],
+                TypeArg::Bounded {
+                    wildcard: Wildcard::Extends,
+                    ..
+                }
+            ));
         } else {
             panic!("expected Class type");
         }
@@ -107,8 +113,16 @@ mod signature_tests {
         let fs = parse_field_signature(sig).unwrap();
         let rendered = fs.ty.to_string();
         assert!(rendered.contains("Map"), "expected Map in: {}", rendered);
-        assert!(rendered.contains("String"), "expected String in: {}", rendered);
-        assert!(rendered.contains("Integer"), "expected Integer in: {}", rendered);
+        assert!(
+            rendered.contains("String"),
+            "expected String in: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("Integer"),
+            "expected Integer in: {}",
+            rendered
+        );
     }
 
     #[test]

@@ -17,9 +17,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-use crate::classfile::ClassFile;
-use crate::codegen::class_writer::render_class;
-use crate::kotlin::writer::{is_kotlin_class, render_kotlin_class};
+use crate::{DecompileLanguage, DecompileOptions, Decompiler};
 
 /// Decompile a .class file from raw bytes.
 ///
@@ -35,19 +33,11 @@ pub unsafe extern "C" fn abyssflower_decompile(data: *const u8, len: usize) -> *
     }
 
     let bytes = std::slice::from_raw_parts(data, len);
-    let cf = match ClassFile::parse(bytes) {
-        Ok(cf) => cf,
+    let output = match Decompiler::default().decompile_bytes(bytes) {
+        Ok(output) => output,
         Err(_) => return ptr::null_mut(),
     };
-
-    // Try Kotlin first, fall back to Java
-    let source = if is_kotlin_class(&cf) {
-        render_kotlin_class(&cf)
-    } else {
-        render_class(&cf)
-    };
-
-    match CString::new(source) {
+    match CString::new(output.source) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),
     }
@@ -64,14 +54,15 @@ pub unsafe extern "C" fn abyssflower_decompile_java(data: *const u8, len: usize)
     }
 
     let bytes = std::slice::from_raw_parts(data, len);
-    let cf = match ClassFile::parse(bytes) {
-        Ok(cf) => cf,
+    let decompiler = Decompiler::new(DecompileOptions {
+        language: DecompileLanguage::Java,
+        ..DecompileOptions::default()
+    });
+    let output = match decompiler.decompile_bytes(bytes) {
+        Ok(output) => output,
         Err(_) => return ptr::null_mut(),
     };
-
-    let source = render_class(&cf);
-
-    match CString::new(source) {
+    match CString::new(output.source) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),
     }
@@ -114,23 +105,11 @@ pub unsafe extern "C" fn abyssflower_decompile_file(path: *const c_char) -> *mut
         Err(_) => return ptr::null_mut(),
     };
 
-    let bytes = match std::fs::read(path_str) {
-        Ok(b) => b,
+    let output = match Decompiler::default().decompile_file(path_str) {
+        Ok(output) => output,
         Err(_) => return ptr::null_mut(),
     };
-
-    let cf = match ClassFile::parse(&bytes) {
-        Ok(cf) => cf,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let source = if is_kotlin_class(&cf) {
-        render_kotlin_class(&cf)
-    } else {
-        render_class(&cf)
-    };
-
-    match CString::new(source) {
+    match CString::new(output.source) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),
     }
@@ -164,37 +143,12 @@ pub unsafe extern "C" fn abyssflower_decompile_jar_entry(
         Err(_) => return ptr::null_mut(),
     };
 
-    let bytes = match read_jar_entry(jar_str, class_str) {
-        Some(b) => b,
-        None => return ptr::null_mut(),
-    };
-
-    let cf = match ClassFile::parse(&bytes) {
-        Ok(cf) => cf,
+    let output = match Decompiler::default().decompile_jar_entry(jar_str, class_str) {
+        Ok(output) => output,
         Err(_) => return ptr::null_mut(),
     };
-
-    let source = if is_kotlin_class(&cf) {
-        render_kotlin_class(&cf)
-    } else {
-        render_class(&cf)
-    };
-
-    match CString::new(source) {
+    match CString::new(output.source) {
         Ok(cs) => cs.into_raw(),
         Err(_) => ptr::null_mut(),
     }
-}
-
-/// Read a single entry from a ZIP/JAR file.
-fn read_jar_entry(jar_path: &str, entry_path: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(jar_path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-    let mut entry = archive.by_name(entry_path).ok()?;
-
-    let mut buf = Vec::with_capacity(entry.size() as usize);
-    entry.read_to_end(&mut buf).ok()?;
-    Some(buf)
 }

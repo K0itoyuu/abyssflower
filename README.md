@@ -38,7 +38,21 @@ Abyssflower reads `.class` files and produces idiomatic Kotlin (or Java) source 
 abyssflower <class-file>
 abyssflower file1.class file2.class ...
 abyssflower <class-file> -o <output-dir>
+abyssflower --jar app.jar --entry com/example/Main.class
 ```
+
+Output language can be selected explicitly with `--java`, `--kotlin`, or
+`--auto` (the default). `--kotlin` fails when valid Kotlin metadata is not
+present; `--auto` falls back to Java and reports a diagnostic when malformed
+Kotlin metadata is encountered. Invalid arguments exit with status 2, runtime
+decompilation or I/O failures with status 1, and successful runs with status 0.
+
+Inputs are resource-bounded by default: class files and uncompressed archive
+entries are limited to 64 MiB, while the archive itself is limited to 512 MiB.
+The limits can be reduced or raised with `--max-class-size`,
+`--max-archive-size`, and `--max-archive-entry-size`. Source files written with
+`-o` are derived from validated JVM class names and remain below that output
+directory.
 
 ```bash
 $ abyssflower Person.class
@@ -167,6 +181,9 @@ The binary is at `target/release/abyssflower`.
 
 ```bash
 cargo test
+cargo test --no-default-features
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## How It Works

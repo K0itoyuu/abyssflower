@@ -5,6 +5,31 @@
 /// for the common case (most types have array_dim == 0).
 use std::fmt;
 
+/// Convert a JVM binary class name to a Java source-level name.
+///
+/// Named member classes use `Outer$Inner` in bytecode and `Outer.Inner` in
+/// source. Anonymous and compiler-generated classes have segments such as
+/// `$1`; those separators must remain `$` because `.1` is not valid Java.
+pub fn binary_name_to_source(name: &str) -> String {
+    let mut source = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '/' => source.push('.'),
+            '$' => {
+                let starts_named_class = chars
+                    .peek()
+                    .is_some_and(|next| *next == '_' || next.is_alphabetic());
+                source.push(if starts_named_class { '.' } else { '$' });
+            }
+            _ => source.push(ch),
+        }
+    }
+
+    source
+}
+
 // ── TypeKind ───────────────────────────────────────────────────────────────
 
 /// The base kind of a Java type (sans array dimensions).
@@ -51,11 +76,11 @@ pub enum TypeKind {
 /// lattice comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TypeFamily {
-    Integer,  // byte, char, short, int, boolean, bytechar, shortchar
+    Integer, // byte, char, short, int, boolean, bytechar, shortchar
     Long,
     Float,
     Double,
-    Object,   // any reference type, array, null
+    Object, // any reference type, array, null
     Boolean,
     Unknown,
 }
@@ -67,9 +92,9 @@ pub enum TypeFamily {
 /// `class_name` is `Some` iff `kind` is `Object` or `GenVar`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JavaType {
-    pub kind:       TypeKind,
+    pub kind: TypeKind,
     /// Number of array dimensions. 0 = not an array.
-    pub array_dim:  u8,
+    pub array_dim: u8,
     /// Binary class name (for Object) or type variable name (for GenVar).
     pub class_name: Option<String>,
 }
@@ -78,31 +103,99 @@ pub struct JavaType {
 
 impl JavaType {
     // primitives
-    pub const BYTE:    JavaType = JavaType { kind: TypeKind::Byte,    array_dim: 0, class_name: None };
-    pub const CHAR:    JavaType = JavaType { kind: TypeKind::Char,    array_dim: 0, class_name: None };
-    pub const DOUBLE:  JavaType = JavaType { kind: TypeKind::Double,  array_dim: 0, class_name: None };
-    pub const FLOAT:   JavaType = JavaType { kind: TypeKind::Float,   array_dim: 0, class_name: None };
-    pub const INT:     JavaType = JavaType { kind: TypeKind::Int,     array_dim: 0, class_name: None };
-    pub const LONG:    JavaType = JavaType { kind: TypeKind::Long,    array_dim: 0, class_name: None };
-    pub const SHORT:   JavaType = JavaType { kind: TypeKind::Short,   array_dim: 0, class_name: None };
-    pub const BOOLEAN: JavaType = JavaType { kind: TypeKind::Boolean, array_dim: 0, class_name: None };
-    pub const VOID:    JavaType = JavaType { kind: TypeKind::Void,    array_dim: 0, class_name: None };
+    pub const BYTE: JavaType = JavaType {
+        kind: TypeKind::Byte,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const CHAR: JavaType = JavaType {
+        kind: TypeKind::Char,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const DOUBLE: JavaType = JavaType {
+        kind: TypeKind::Double,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const FLOAT: JavaType = JavaType {
+        kind: TypeKind::Float,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const INT: JavaType = JavaType {
+        kind: TypeKind::Int,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const LONG: JavaType = JavaType {
+        kind: TypeKind::Long,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const SHORT: JavaType = JavaType {
+        kind: TypeKind::Short,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const BOOLEAN: JavaType = JavaType {
+        kind: TypeKind::Boolean,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const VOID: JavaType = JavaType {
+        kind: TypeKind::Void,
+        array_dim: 0,
+        class_name: None,
+    };
 
     // special
-    pub const NULL:        JavaType = JavaType { kind: TypeKind::Null,       array_dim: 0, class_name: None };
-    pub const UNKNOWN:     JavaType = JavaType { kind: TypeKind::Unknown,    array_dim: 0, class_name: None };
-    pub const GROUP2EMPTY: JavaType = JavaType { kind: TypeKind::Group2Empty,array_dim: 0, class_name: None };
-    pub const ADDRESS:     JavaType = JavaType { kind: TypeKind::Address,    array_dim: 0, class_name: None };
-    pub const BYTECHAR:    JavaType = JavaType { kind: TypeKind::ByteChar,   array_dim: 0, class_name: None };
-    pub const SHORTCHAR:   JavaType = JavaType { kind: TypeKind::ShortChar,  array_dim: 0, class_name: None };
+    pub const NULL: JavaType = JavaType {
+        kind: TypeKind::Null,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const UNKNOWN: JavaType = JavaType {
+        kind: TypeKind::Unknown,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const GROUP2EMPTY: JavaType = JavaType {
+        kind: TypeKind::Group2Empty,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const ADDRESS: JavaType = JavaType {
+        kind: TypeKind::Address,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const BYTECHAR: JavaType = JavaType {
+        kind: TypeKind::ByteChar,
+        array_dim: 0,
+        class_name: None,
+    };
+    pub const SHORTCHAR: JavaType = JavaType {
+        kind: TypeKind::ShortChar,
+        array_dim: 0,
+        class_name: None,
+    };
 
     // common object types
     pub fn object(class_name: impl Into<String>) -> Self {
-        JavaType { kind: TypeKind::Object, array_dim: 0, class_name: Some(class_name.into()) }
+        JavaType {
+            kind: TypeKind::Object,
+            array_dim: 0,
+            class_name: Some(class_name.into()),
+        }
     }
 
     pub fn genvar(name: impl Into<String>) -> Self {
-        JavaType { kind: TypeKind::GenVar, array_dim: 0, class_name: Some(name.into()) }
+        JavaType {
+            kind: TypeKind::GenVar,
+            array_dim: 0,
+            class_name: Some(name.into()),
+        }
     }
 
     /// Wrap this type in one additional array dimension.
@@ -120,9 +213,18 @@ impl JavaType {
     // ── queries ────────────────────────────────────────────────────────
 
     pub fn is_primitive(&self) -> bool {
-        self.array_dim == 0 && matches!(self.kind,
-            TypeKind::Byte | TypeKind::Char | TypeKind::Double | TypeKind::Float |
-            TypeKind::Int  | TypeKind::Long | TypeKind::Short  | TypeKind::Boolean)
+        self.array_dim == 0
+            && matches!(
+                self.kind,
+                TypeKind::Byte
+                    | TypeKind::Char
+                    | TypeKind::Double
+                    | TypeKind::Float
+                    | TypeKind::Int
+                    | TypeKind::Long
+                    | TypeKind::Short
+                    | TypeKind::Boolean
+            )
     }
 
     pub fn is_void(&self) -> bool {
@@ -130,11 +232,16 @@ impl JavaType {
     }
 
     pub fn is_reference(&self) -> bool {
-        self.array_dim > 0 || matches!(self.kind,
-            TypeKind::Object | TypeKind::Null | TypeKind::GenVar)
+        self.array_dim > 0
+            || matches!(
+                self.kind,
+                TypeKind::Object | TypeKind::Null | TypeKind::GenVar
+            )
     }
 
-    pub fn is_array(&self) -> bool { self.array_dim > 0 }
+    pub fn is_array(&self) -> bool {
+        self.array_dim > 0
+    }
 
     pub fn is_wide(&self) -> bool {
         self.array_dim == 0 && matches!(self.kind, TypeKind::Long | TypeKind::Double)
@@ -142,7 +249,9 @@ impl JavaType {
 
     /// JVM operand stack slots occupied by this type.
     pub fn stack_size(&self) -> u8 {
-        if self.array_dim > 0 { return 1; }
+        if self.array_dim > 0 {
+            return 1;
+        }
         match self.kind {
             TypeKind::Long | TypeKind::Double => 2,
             TypeKind::Void | TypeKind::Group2Empty => 0,
@@ -155,12 +264,16 @@ impl JavaType {
             return TypeFamily::Object;
         }
         match self.kind {
-            TypeKind::Byte | TypeKind::Char | TypeKind::Short |
-            TypeKind::Int  | TypeKind::ByteChar | TypeKind::ShortChar => TypeFamily::Integer,
-            TypeKind::Boolean  => TypeFamily::Boolean,
-            TypeKind::Long     => TypeFamily::Long,
-            TypeKind::Float    => TypeFamily::Float,
-            TypeKind::Double   => TypeFamily::Double,
+            TypeKind::Byte
+            | TypeKind::Char
+            | TypeKind::Short
+            | TypeKind::Int
+            | TypeKind::ByteChar
+            | TypeKind::ShortChar => TypeFamily::Integer,
+            TypeKind::Boolean => TypeFamily::Boolean,
+            TypeKind::Long => TypeFamily::Long,
+            TypeKind::Float => TypeFamily::Float,
+            TypeKind::Double => TypeFamily::Double,
             TypeKind::Object | TypeKind::Null | TypeKind::GenVar => TypeFamily::Object,
             _ => TypeFamily::Unknown,
         }
@@ -168,13 +281,15 @@ impl JavaType {
 
     /// The class name, panics if `kind` is not Object or GenVar.
     pub fn class_name(&self) -> &str {
-        self.class_name.as_deref().expect("JavaType has no class name")
+        self.class_name
+            .as_deref()
+            .expect("JavaType has no class name")
     }
 
     /// Simple class name: last segment after `/`.
     pub fn simple_class_name(&self) -> &str {
         let n = self.class_name();
-        n.rfind('/').map(|i| &n[i+1..]).unwrap_or(n)
+        n.rfind('/').map(|i| &n[i + 1..]).unwrap_or(n)
     }
 }
 
@@ -184,29 +299,27 @@ impl fmt::Display for JavaType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Write the base type
         match &self.kind {
-            TypeKind::Byte    => write!(f, "byte")?,
-            TypeKind::Char    => write!(f, "char")?,
-            TypeKind::Double  => write!(f, "double")?,
-            TypeKind::Float   => write!(f, "float")?,
-            TypeKind::Int     => write!(f, "int")?,
-            TypeKind::Long    => write!(f, "long")?,
-            TypeKind::Short   => write!(f, "short")?,
+            TypeKind::Byte => write!(f, "byte")?,
+            TypeKind::Char => write!(f, "char")?,
+            TypeKind::Double => write!(f, "double")?,
+            TypeKind::Float => write!(f, "float")?,
+            TypeKind::Int => write!(f, "int")?,
+            TypeKind::Long => write!(f, "long")?,
+            TypeKind::Short => write!(f, "short")?,
             TypeKind::Boolean => write!(f, "boolean")?,
-            TypeKind::Void    => write!(f, "void")?,
-            TypeKind::Null    => write!(f, "null")?,
+            TypeKind::Void => write!(f, "void")?,
+            TypeKind::Null => write!(f, "null")?,
             TypeKind::Unknown => write!(f, "/*unknown*/")?,
             TypeKind::Group2Empty => write!(f, "/*group2empty*/")?,
             TypeKind::Address => write!(f, "/*address*/")?,
-            TypeKind::ByteChar  => write!(f, "/*byte|char*/")?,
+            TypeKind::ByteChar => write!(f, "/*byte|char*/")?,
             TypeKind::ShortChar => write!(f, "/*short|char*/")?,
-            TypeKind::GenVar  => {
+            TypeKind::GenVar => {
                 write!(f, "{}", self.class_name.as_deref().unwrap_or("?"))?;
             }
             TypeKind::Object => {
                 if let Some(name) = &self.class_name {
-                    // Convert binary name to source name: replace '/' with '.'
-                    // and inner class '$' with '.'.
-                    write!(f, "{}", name.replace('/', ".").replace('$', "."))?;
+                    write!(f, "{}", binary_name_to_source(name))?;
                 } else {
                     write!(f, "Object")?;
                 }
@@ -242,25 +355,27 @@ impl JavaType {
     /// Render back to JVM descriptor form (without array brackets — caller adds `[`s).
     pub fn to_descriptor_base(&self) -> String {
         match &self.kind {
-            TypeKind::Byte    => "B".into(),
-            TypeKind::Char    => "C".into(),
-            TypeKind::Double  => "D".into(),
-            TypeKind::Float   => "F".into(),
-            TypeKind::Int     => "I".into(),
-            TypeKind::Long    => "J".into(),
-            TypeKind::Short   => "S".into(),
+            TypeKind::Byte => "B".into(),
+            TypeKind::Char => "C".into(),
+            TypeKind::Double => "D".into(),
+            TypeKind::Float => "F".into(),
+            TypeKind::Int => "I".into(),
+            TypeKind::Long => "J".into(),
+            TypeKind::Short => "S".into(),
             TypeKind::Boolean => "Z".into(),
-            TypeKind::Void    => "V".into(),
-            TypeKind::Object  => format!("L{};", self.class_name.as_deref().unwrap_or("")),
-            TypeKind::GenVar  => format!("T{};", self.class_name.as_deref().unwrap_or("")),
-            _                 => "?".into(),
+            TypeKind::Void => "V".into(),
+            TypeKind::Object => format!("L{};", self.class_name.as_deref().unwrap_or("")),
+            TypeKind::GenVar => format!("T{};", self.class_name.as_deref().unwrap_or("")),
+            _ => "?".into(),
         }
     }
 
     /// Full JVM descriptor string including array prefix.
     pub fn to_descriptor(&self) -> String {
         let mut s = String::with_capacity(self.array_dim as usize + 32);
-        for _ in 0..self.array_dim { s.push('['); }
+        for _ in 0..self.array_dim {
+            s.push('[');
+        }
         s.push_str(&self.to_descriptor_base());
         s
     }

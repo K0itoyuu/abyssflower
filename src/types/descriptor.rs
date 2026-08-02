@@ -39,7 +39,8 @@ fn parse_type_at(s: &str, offset: usize) -> Result<(JavaType, usize)> {
 
     if pos >= bytes.len() {
         return Err(DecompileError::MalformedAttribute(
-            "descriptor", format!("unexpected end at offset {pos}"),
+            "descriptor",
+            format!("unexpected end at offset {pos}"),
         ));
     }
 
@@ -49,20 +50,21 @@ fn parse_type_at(s: &str, offset: usize) -> Result<(JavaType, usize)> {
             // Object: 'L' BinaryName ';'
             let end = s[pos..].find(';').ok_or_else(|| {
                 DecompileError::MalformedAttribute(
-                    "descriptor", format!("missing ';' after 'L' at offset {pos}"),
+                    "descriptor",
+                    format!("missing ';' after 'L' at offset {pos}"),
                 )
             })? + pos;
             let class_name = &s[pos + 1..end];
             (JavaType::object(class_name), end + 1 - offset)
         }
-        'V' => (JavaType::VOID,    pos + 1 - offset),
-        'B' => (JavaType::BYTE,    pos + 1 - offset),
-        'C' => (JavaType::CHAR,    pos + 1 - offset),
-        'D' => (JavaType::DOUBLE,  pos + 1 - offset),
-        'F' => (JavaType::FLOAT,   pos + 1 - offset),
-        'I' => (JavaType::INT,     pos + 1 - offset),
-        'J' => (JavaType::LONG,    pos + 1 - offset),
-        'S' => (JavaType::SHORT,   pos + 1 - offset),
+        'V' => (JavaType::VOID, pos + 1 - offset),
+        'B' => (JavaType::BYTE, pos + 1 - offset),
+        'C' => (JavaType::CHAR, pos + 1 - offset),
+        'D' => (JavaType::DOUBLE, pos + 1 - offset),
+        'F' => (JavaType::FLOAT, pos + 1 - offset),
+        'I' => (JavaType::INT, pos + 1 - offset),
+        'J' => (JavaType::LONG, pos + 1 - offset),
+        'S' => (JavaType::SHORT, pos + 1 - offset),
         'Z' => (JavaType::BOOLEAN, pos + 1 - offset),
         other => {
             return Err(DecompileError::MalformedAttribute(
@@ -80,7 +82,7 @@ fn parse_type_at(s: &str, offset: usize) -> Result<(JavaType, usize)> {
 /// A parsed method descriptor.
 #[derive(Debug, Clone)]
 pub struct MethodDescriptor {
-    pub params:     Vec<JavaType>,
+    pub params: Vec<JavaType>,
     pub return_type: JavaType,
 }
 
@@ -89,7 +91,8 @@ impl MethodDescriptor {
     pub fn parse(s: &str) -> Result<Self> {
         if s.is_empty() || s.as_bytes()[0] != b'(' {
             return Err(DecompileError::MalformedAttribute(
-                "method descriptor", format!("must start with '(': {s}"),
+                "method descriptor",
+                format!("must start with '(': {s}"),
             ));
         }
 
@@ -112,7 +115,10 @@ impl MethodDescriptor {
         // Parse return type
         let (return_type, _) = parse_type_at(return_str, 0)?;
 
-        Ok(MethodDescriptor { params, return_type })
+        Ok(MethodDescriptor {
+            params,
+            return_type,
+        })
     }
 
     /// Number of JVM local-variable slots consumed by the parameters.
@@ -126,7 +132,9 @@ impl std::fmt::Display for MethodDescriptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "(")?;
         for (i, p) in self.params.iter().enumerate() {
-            if i > 0 { write!(f, ", ")?; }
+            if i > 0 {
+                write!(f, ", ")?;
+            }
             write!(f, "{p}")?;
         }
         write!(f, ") -> {}", self.return_type)

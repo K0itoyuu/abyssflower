@@ -1,6 +1,125 @@
 /// Kotlin type rendering — converts KType to Kotlin syntax strings.
-
 use super::metadata::*;
+
+/// Render an arbitrary JVM/metadata name as a legal Kotlin identifier.
+pub fn kotlin_identifier(name: &str) -> String {
+    const KEYWORDS: &[&str] = &[
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
+        "by",
+        "catch",
+        "constructor",
+        "delegate",
+        "dynamic",
+        "field",
+        "file",
+        "finally",
+        "get",
+        "import",
+        "init",
+        "param",
+        "property",
+        "receiver",
+        "set",
+        "setparam",
+        "where",
+        "actual",
+        "abstract",
+        "annotation",
+        "companion",
+        "const",
+        "crossinline",
+        "data",
+        "enum",
+        "expect",
+        "external",
+        "final",
+        "infix",
+        "inline",
+        "inner",
+        "internal",
+        "lateinit",
+        "noinline",
+        "open",
+        "operator",
+        "out",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "reified",
+        "sealed",
+        "suspend",
+        "tailrec",
+        "vararg",
+    ];
+    let mut chars = name.chars();
+    let valid_start = chars.next().is_some_and(|c| c == '_' || c.is_alphabetic());
+    let valid_rest = chars.all(|c| c == '_' || c.is_alphanumeric());
+    if valid_start && valid_rest && !KEYWORDS.contains(&name) {
+        name.to_string()
+    } else {
+        format!("`{}`", name.replace('`', "_"))
+    }
+}
+
+/// Render a JVM binary class name as a Kotlin source name. Named member
+/// classes use dots; anonymous/synthetic names remain one escaped identifier
+/// so numeric and empty `$` segments cannot leak into the grammar.
+pub fn kotlin_class_name(internal: &str) -> String {
+    let binary = internal.rsplit('/').next().unwrap_or(internal);
+    let segments = binary.split('$').collect::<Vec<_>>();
+    let all_named = segments.iter().all(|segment| {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|first| first == '_' || first.is_alphabetic())
+            && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+    });
+    if all_named {
+        segments
+            .iter()
+            .map(|segment| kotlin_identifier(segment))
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        kotlin_identifier(binary)
+    }
+}
+
+pub fn kotlin_package_name(package: &str) -> String {
+    package
+        .split(['/', '.'])
+        .map(kotlin_identifier)
+        .collect::<Vec<_>>()
+        .join(".")
+}
 
 /// Render a KType to its Kotlin string representation.
 pub fn render_kotlin_type(ty: &KType, type_params: &[KTypeParameter]) -> String {
@@ -13,7 +132,8 @@ pub fn render_kotlin_type(ty: &KType, type_params: &[KTypeParameter]) -> String 
         kotlin_type_name(class_name)
     } else if let Some(tp_id) = ty.type_parameter_id {
         // Resolve type parameter name from the type_params list
-        type_params.iter()
+        type_params
+            .iter()
             .find(|p| p.id == tp_id)
             .map(|p| p.name.clone())
             .or_else(|| ty.type_parameter_name.clone())
@@ -38,9 +158,11 @@ pub fn render_kotlin_type(ty: &KType, type_params: &[KTypeParameter]) -> String 
     // Render type arguments
     let mut result = base;
     if !ty.arguments.is_empty() {
-        let args: Vec<String> = ty.arguments.iter().map(|a| {
-            render_type_argument(a, type_params)
-        }).collect();
+        let args: Vec<String> = ty
+            .arguments
+            .iter()
+            .map(|a| render_type_argument(a, type_params))
+            .collect();
         result = format!("{}<{}>", result, args.join(", "));
     }
 
@@ -96,13 +218,16 @@ fn render_function_type(ty: &KType, type_params: &[KTypeParameter]) -> String {
     let params = &ty.arguments[..ty.arguments.len() - 1];
     let return_arg = &ty.arguments[ty.arguments.len() - 1];
 
-    let param_strs: Vec<String> = params.iter().map(|a| {
-        if let Some(ref t) = a.type_ {
-            render_kotlin_type(t, type_params)
-        } else {
-            "Any?".to_string()
-        }
-    }).collect();
+    let param_strs: Vec<String> = params
+        .iter()
+        .map(|a| {
+            if let Some(ref t) = a.type_ {
+                render_kotlin_type(t, type_params)
+            } else {
+                "Any?".to_string()
+            }
+        })
+        .collect();
 
     let return_str = if let Some(ref t) = return_arg.type_ {
         render_kotlin_type(t, type_params)
@@ -161,8 +286,7 @@ pub fn kotlin_type_name(internal: &str) -> String {
         "kotlin/collections/MutableMap.MutableEntry" => "MutableMap.MutableEntry".to_string(),
         _ => {
             // For other types, extract the simple name
-            let name = internal.rsplit('/').next().unwrap_or(internal);
-            name.replace('$', ".").to_string()
+            kotlin_class_name(internal)
         }
     }
 }
@@ -173,30 +297,60 @@ pub fn render_type_params_decl(params: &[KTypeParameter]) -> String {
         return String::new();
     }
 
-    let strs: Vec<String> = params.iter().map(|tp| {
-        let mut s = String::new();
+    let strs: Vec<String> = params
+        .iter()
+        .map(|tp| {
+            let mut s = String::new();
 
-        if tp.reified {
-            s.push_str("reified ");
-        }
-        match tp.variance {
-            Variance::In => s.push_str("in "),
-            Variance::Out => s.push_str("out "),
-            Variance::Inv => {}
-        }
-        s.push_str(&tp.name);
-
-        // Upper bounds (only first one goes here, rest go in where clause)
-        if let Some(first_bound) = tp.upper_bounds.first() {
-            let bound_str = render_kotlin_type(first_bound, params);
-            if bound_str != "Any?" {
-                s.push_str(" : ");
-                s.push_str(&bound_str);
+            if tp.reified {
+                s.push_str("reified ");
             }
-        }
+            match tp.variance {
+                Variance::In => s.push_str("in "),
+                Variance::Out => s.push_str("out "),
+                Variance::Inv => {}
+            }
+            s.push_str(&tp.name);
 
-        s
-    }).collect();
+            // Upper bounds (only first one goes here, rest go in where clause)
+            if let Some(first_bound) = tp.upper_bounds.first() {
+                let bound_str = render_kotlin_type(first_bound, params);
+                if bound_str != "Any?" {
+                    s.push_str(" : ");
+                    s.push_str(&bound_str);
+                }
+            }
+
+            s
+        })
+        .collect();
 
     format!("<{}>", strs.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kotlin_class_name, kotlin_identifier, kotlin_package_name};
+
+    #[test]
+    fn escapes_keywords_and_jvm_names() {
+        assert_eq!(kotlin_identifier("value"), "value");
+        assert_eq!(kotlin_identifier("when"), "`when`");
+        assert_eq!(kotlin_identifier("$continuation"), "`$continuation`");
+        assert_eq!(kotlin_identifier("foo$default"), "`foo$default`");
+    }
+
+    #[test]
+    fn renders_named_and_synthetic_binary_class_names() {
+        assert_eq!(kotlin_class_name("pkg/Outer$Inner"), "Outer.Inner");
+        assert_eq!(kotlin_class_name("pkg/Outer$lambda$1"), "`Outer$lambda$1`");
+        assert_eq!(
+            kotlin_class_name("pkg/Outer$special$$inlined$1"),
+            "`Outer$special$$inlined$1`"
+        );
+        assert_eq!(
+            kotlin_package_name("net/example/fun/tools"),
+            "net.example.`fun`.tools"
+        );
+    }
 }

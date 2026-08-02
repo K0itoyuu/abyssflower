@@ -32,9 +32,9 @@ pub enum LoopKind {
 #[derive(Debug, Clone)]
 pub struct CaseArm {
     /// `None` = `default:`, `Some(v)` = `case v:`.
-    pub value:  Option<i32>,
+    pub value: Option<i32>,
     /// The body of this arm (may fall through to the next).
-    pub body:   StmtId,
+    pub body: StmtId,
     /// Whether this arm has an explicit `break` at the end.
     pub breaks: bool,
 }
@@ -65,6 +65,9 @@ pub enum Stmt {
     /// Loop (while / do-while / infinite).
     Loop(LoopStmt),
 
+    /// Conditional edge that exits the innermost natural loop.
+    BreakIf(BreakIfStmt),
+
     /// switch / tableswitch / lookupswitch.
     Switch(SwitchStmt),
 
@@ -82,7 +85,7 @@ pub enum Stmt {
 
 #[derive(Debug, Clone)]
 pub struct BlockStmt {
-    pub block_id:     BlockId,
+    pub block_id: BlockId,
     pub instructions: Vec<Instruction>,
     /// Successor hint: resolved after structuring.
     pub succs: Vec<BlockId>,
@@ -119,25 +122,33 @@ pub struct IfStmt {
 
 #[derive(Debug, Clone)]
 pub struct LoopStmt {
-    pub kind:          LoopKind,
+    pub kind: LoopKind,
     /// The loop header block id (target of the back-edge).
-    pub header_block:  BlockId,
+    pub header_block: BlockId,
     /// The back-edge tail block id.
-    pub tail_block:    BlockId,
+    pub tail_block: BlockId,
     /// All block ids that belong to the loop body.
-    pub body_blocks:   Vec<BlockId>,
+    pub body_blocks: Vec<BlockId>,
     /// The loop body as a structured statement.
-    pub body:          StmtId,
+    pub body: StmtId,
     /// Block id immediately after the loop (the loop exit).
-    pub post_block:    Option<BlockId>,
+    pub post_block: Option<BlockId>,
     /// Instructions of the condition block (header for while, tail for do-while).
     /// Stored here so the writer can simulate exactly the right instructions.
-    pub cond_insns:    Vec<Instruction>,
+    pub cond_insns: Vec<Instruction>,
     /// True when the printed condition is the negation of the branch opcode's
     /// predicate — i.e. the conditional branch *leaves* the loop and control
     /// stays in the loop on fall-through.  False when the branch is a back-edge
     /// that continues the loop.
-    pub cond_negated:  bool,
+    pub cond_negated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BreakIfStmt {
+    pub cond_block: BlockId,
+    pub cond_insns: Vec<Instruction>,
+    /// True when the fall-through edge exits and the branch predicate must be inverted.
+    pub negated: bool,
 }
 
 // ── SwitchStmt ───────────────────────────────────────────────────────────
@@ -146,9 +157,10 @@ pub struct LoopStmt {
 pub struct SwitchStmt {
     /// Block containing the tableswitch / lookupswitch instruction.
     pub switch_block: BlockId,
-    pub arms:         Vec<CaseArm>,
+    pub switch_insns: Vec<Instruction>,
+    pub arms: Vec<CaseArm>,
     /// Block after the switch (post-dominator).
-    pub post_block:   Option<BlockId>,
+    pub post_block: Option<BlockId>,
 }
 
 // ── TryCatchStmt ─────────────────────────────────────────────────────────
@@ -156,9 +168,9 @@ pub struct SwitchStmt {
 #[derive(Debug, Clone)]
 pub struct TryCatchStmt {
     /// The protected body.
-    pub try_body:   StmtId,
+    pub try_body: StmtId,
     /// The catch / finally clauses.
-    pub catches:    Vec<CatchClause>,
+    pub catches: Vec<CatchClause>,
     /// Optional finally body (always-runs block).
     pub finally_body: Option<StmtId>,
 }
@@ -168,7 +180,7 @@ pub struct TryCatchStmt {
 #[derive(Debug, Clone)]
 pub struct SyncStmt {
     pub monitor_block: BlockId,
-    pub body:          StmtId,
+    pub body: StmtId,
 }
 
 // ── StmtArena ────────────────────────────────────────────────────────────
@@ -183,7 +195,9 @@ pub struct StmtArena {
 }
 
 impl StmtArena {
-    pub fn new() -> Self { StmtArena { stmts: Vec::new() } }
+    pub fn new() -> Self {
+        StmtArena { stmts: Vec::new() }
+    }
 
     pub fn alloc(&mut self, stmt: Stmt) -> StmtId {
         let id = self.stmts.len() as StmtId;
@@ -199,5 +213,11 @@ impl StmtArena {
         &mut self.stmts[id as usize]
     }
 
-    pub fn len(&self) -> usize { self.stmts.len() }
+    pub fn len(&self) -> usize {
+        self.stmts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stmts.is_empty()
+    }
 }

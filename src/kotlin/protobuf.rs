@@ -1,7 +1,7 @@
-/// Minimal protobuf wire-format decoder for Kotlin metadata.
-///
-/// Supports only what's needed: varint, length-delimited messages, packed repeated.
-/// No code generation — hand-written field dispatch.
+//! Minimal protobuf wire-format decoder for Kotlin metadata.
+//!
+//! Supports only what's needed: varint, length-delimited messages, packed repeated.
+//! No code generation; field dispatch is hand-written.
 
 /// Wire types used in protobuf encoding.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -109,16 +109,24 @@ impl<'a> ProtoReader<'a> {
     /// Skip a field value based on its wire type.
     pub fn skip(&mut self, wire_type: WireType) -> Option<()> {
         match wire_type {
-            WireType::Varint => { self.read_varint()?; }
+            WireType::Varint => {
+                self.read_varint()?;
+            }
             WireType::Fixed64 => {
-                if self.pos + 8 > self.data.len() { return None; }
+                if self.pos + 8 > self.data.len() {
+                    return None;
+                }
                 self.pos += 8;
             }
             WireType::Fixed32 => {
-                if self.pos + 4 > self.data.len() { return None; }
+                if self.pos + 4 > self.data.len() {
+                    return None;
+                }
                 self.pos += 4;
             }
-            WireType::LengthDelimited => { self.read_bytes()?; }
+            WireType::LengthDelimited => {
+                self.read_bytes()?;
+            }
         }
         Some(())
     }

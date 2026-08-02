@@ -4,17 +4,17 @@
 /// wildcards, and type variable references, e.g.:
 ///   `<T:Ljava/lang/Comparable<TT;>;>(TT;Ljava/util/List<+TT;>;)TT;`
 use crate::error::{DecompileError, Result};
-use crate::types::java_type::JavaType;
+use crate::types::java_type::{binary_name_to_source, JavaType};
 use std::fmt;
 
 // ── Generic type argument wildcard ────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Wildcard {
-    None,       // no wildcard (exact type)
-    Extends,    // `? extends T`  ('+' in JVM signature)
-    Super,      // `? super T`    ('-' in JVM signature)
-    Any,        // `?`            (just '*')
+    None,    // no wildcard (exact type)
+    Extends, // `? extends T`  ('+' in JVM signature)
+    Super,   // `? super T`    ('-' in JVM signature)
+    Any,     // `?`            (just '*')
 }
 
 // ── GenericType ───────────────────────────────────────────────────────────
@@ -35,10 +35,7 @@ pub enum GenericType {
         array_dim: u8,
     },
     /// An array whose element type is itself a generic type (e.g. `T[]`).
-    Array {
-        element: Box<GenericType>,
-        dims: u8,
-    },
+    Array { element: Box<GenericType>, dims: u8 },
 }
 
 /// A single type argument in a parameterized type.
@@ -47,7 +44,10 @@ pub enum TypeArg {
     /// `?`
     Wildcard,
     /// `? extends Foo` or exact `Foo`
-    Bounded { wildcard: Wildcard, ty: Box<GenericType> },
+    Bounded {
+        wildcard: Wildcard,
+        ty: Box<GenericType>,
+    },
 }
 
 // ── Formal type parameter ─────────────────────────────────────────────────
@@ -55,9 +55,9 @@ pub enum TypeArg {
 /// A single formal type parameter declaration: `T extends Bound1 & Bound2`.
 #[derive(Debug, Clone)]
 pub struct TypeParam {
-    pub name:         String,
+    pub name: String,
     /// Class bound (at most one, from the first `:` without a preceding name)
-    pub class_bound:  Option<Box<GenericType>>,
+    pub class_bound: Option<Box<GenericType>>,
     /// Interface bounds (subsequent `:` separated types)
     pub iface_bounds: Vec<GenericType>,
 }
@@ -67,18 +67,18 @@ pub struct TypeParam {
 /// Parsed class signature (`Signature` attribute on a class).
 #[derive(Debug, Clone)]
 pub struct ClassSignature {
-    pub type_params:   Vec<TypeParam>,
-    pub superclass:    GenericType,
+    pub type_params: Vec<TypeParam>,
+    pub superclass: GenericType,
     pub superinterfaces: Vec<GenericType>,
 }
 
 /// Parsed method signature.
 #[derive(Debug, Clone)]
 pub struct MethodSignature {
-    pub type_params:    Vec<TypeParam>,
-    pub params:         Vec<GenericType>,
-    pub return_type:    GenericType,
-    pub throws:         Vec<GenericType>,
+    pub type_params: Vec<TypeParam>,
+    pub params: Vec<GenericType>,
+    pub return_type: GenericType,
+    pub throws: Vec<GenericType>,
 }
 
 /// Parsed field signature (just a reference type, possibly generic).
@@ -96,16 +96,24 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(s: &'a str) -> Self {
-        Parser { src: s.as_bytes(), pos: 0 }
+        Parser {
+            src: s.as_bytes(),
+            pos: 0,
+        }
     }
 
-    fn remaining(&self) -> usize { self.src.len() - self.pos }
-    fn peek(&self) -> Option<u8>  { self.src.get(self.pos).copied() }
+    fn remaining(&self) -> usize {
+        self.src.len() - self.pos
+    }
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
 
     fn consume(&mut self) -> Result<u8> {
         if self.pos >= self.src.len() {
             return Err(DecompileError::MalformedAttribute(
-                "signature", "unexpected end of signature".into()
+                "signature",
+                "unexpected end of signature".into(),
             ));
         }
         let b = self.src[self.pos];
@@ -126,7 +134,12 @@ impl<'a> Parser<'a> {
     }
 
     fn consume_if(&mut self, c: u8) -> bool {
-        if self.peek() == Some(c) { self.pos += 1; true } else { false }
+        if self.peek() == Some(c) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Read characters until `delimiter` (exclusive), return the slice.
@@ -180,7 +193,11 @@ impl<'a> Parser<'a> {
             iface_bounds.push(self.parse_ref_type_sig()?);
         }
 
-        Ok(TypeParam { name, class_bound, iface_bounds })
+        Ok(TypeParam {
+            name,
+            class_bound,
+            iface_bounds,
+        })
     }
 
     // ── type signature parsing ─────────────────────────────────────────
@@ -191,16 +208,24 @@ impl<'a> Parser<'a> {
             Some(b'[') => self.parse_array_type_sig(),
             Some(b'L') => self.parse_class_type_sig(0),
             Some(b'T') => self.parse_type_var(),
-            Some(b'V') => { self.pos += 1; Ok(GenericType::Base(JavaType::VOID)) }
-            Some(c)    => {
-                let ty = JavaType::from_descriptor_char(c as char)
-                    .ok_or_else(|| DecompileError::MalformedAttribute(
-                        "signature", format!("unknown base type '{}'", c as char),
-                    ))?;
+            Some(b'V') => {
+                self.pos += 1;
+                Ok(GenericType::Base(JavaType::VOID))
+            }
+            Some(c) => {
+                let ty = JavaType::from_descriptor_char(c as char).ok_or_else(|| {
+                    DecompileError::MalformedAttribute(
+                        "signature",
+                        format!("unknown base type '{}'", c as char),
+                    )
+                })?;
                 self.pos += 1;
                 Ok(GenericType::Base(ty))
             }
-            None => Err(DecompileError::MalformedAttribute("signature", "empty signature".into())),
+            None => Err(DecompileError::MalformedAttribute(
+                "signature",
+                "empty signature".into(),
+            )),
         }
     }
 
@@ -212,7 +237,10 @@ impl<'a> Parser<'a> {
             Some(b'T') => self.parse_type_var(),
             other => Err(DecompileError::MalformedAttribute(
                 "signature",
-                format!("expected reference type, got {:?}", other.map(|c| c as char)),
+                format!(
+                    "expected reference type, got {:?}",
+                    other.map(|c| c as char)
+                ),
             )),
         }
     }
@@ -224,7 +252,10 @@ impl<'a> Parser<'a> {
             dims += 1;
         }
         let element = self.parse_type_sig()?;
-        Ok(GenericType::Array { element: Box::new(element), dims })
+        Ok(GenericType::Array {
+            element: Box::new(element),
+            dims,
+        })
     }
 
     fn parse_type_var(&mut self) -> Result<GenericType> {
@@ -243,7 +274,10 @@ impl<'a> Parser<'a> {
 
         loop {
             match self.peek() {
-                Some(b';') => { self.pos += 1; break; }
+                Some(b';') => {
+                    self.pos += 1;
+                    break;
+                }
                 Some(b'<') => {
                     // type arguments
                     self.pos += 1; // consume '<'
@@ -261,13 +295,20 @@ impl<'a> Parser<'a> {
                     class_name.push(c as char);
                     self.pos += 1;
                 }
-                None => return Err(DecompileError::MalformedAttribute(
-                    "signature", "unterminated class type signature".into()
-                )),
+                None => {
+                    return Err(DecompileError::MalformedAttribute(
+                        "signature",
+                        "unterminated class type signature".into(),
+                    ))
+                }
             }
         }
 
-        Ok(GenericType::Class { class_name, args, array_dim })
+        Ok(GenericType::Class {
+            class_name,
+            args,
+            array_dim,
+        })
     }
 
     fn parse_type_arg(&mut self) -> Result<TypeArg> {
@@ -279,16 +320,25 @@ impl<'a> Parser<'a> {
             Some(b'+') => {
                 self.pos += 1;
                 let ty = self.parse_ref_type_sig()?;
-                Ok(TypeArg::Bounded { wildcard: Wildcard::Extends, ty: Box::new(ty) })
+                Ok(TypeArg::Bounded {
+                    wildcard: Wildcard::Extends,
+                    ty: Box::new(ty),
+                })
             }
             Some(b'-') => {
                 self.pos += 1;
                 let ty = self.parse_ref_type_sig()?;
-                Ok(TypeArg::Bounded { wildcard: Wildcard::Super, ty: Box::new(ty) })
+                Ok(TypeArg::Bounded {
+                    wildcard: Wildcard::Super,
+                    ty: Box::new(ty),
+                })
             }
             _ => {
                 let ty = self.parse_ref_type_sig()?;
-                Ok(TypeArg::Bounded { wildcard: Wildcard::None, ty: Box::new(ty) })
+                Ok(TypeArg::Bounded {
+                    wildcard: Wildcard::None,
+                    ty: Box::new(ty),
+                })
             }
         }
     }
@@ -300,12 +350,16 @@ impl<'a> Parser<'a> {
 pub fn parse_class_signature(sig: &str) -> Result<ClassSignature> {
     let mut p = Parser::new(sig);
     let type_params = p.parse_type_params()?;
-    let superclass  = p.parse_class_type_sig(0)?;
+    let superclass = p.parse_class_type_sig(0)?;
     let mut superinterfaces = Vec::new();
     while p.remaining() > 0 {
         superinterfaces.push(p.parse_ref_type_sig()?);
     }
-    Ok(ClassSignature { type_params, superclass, superinterfaces })
+    Ok(ClassSignature {
+        type_params,
+        superclass,
+        superinterfaces,
+    })
 }
 
 /// Parse a method signature string.
@@ -323,7 +377,12 @@ pub fn parse_method_signature(sig: &str) -> Result<MethodSignature> {
     while p.consume_if(b'^') {
         throws.push(p.parse_ref_type_sig()?);
     }
-    Ok(MethodSignature { type_params, params, return_type, throws })
+    Ok(MethodSignature {
+        type_params,
+        params,
+        return_type,
+        throws,
+    })
 }
 
 /// Parse a field/variable signature string.
@@ -338,25 +397,35 @@ pub fn parse_field_signature(sig: &str) -> Result<FieldSignature> {
 impl fmt::Display for GenericType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GenericType::Base(t)    => write!(f, "{t}"),
+            GenericType::Base(t) => write!(f, "{t}"),
             GenericType::TypeVar(n) => write!(f, "{n}"),
-            GenericType::Class { class_name, args, array_dim } => {
-                let src_name = class_name.replace('/', ".").replace('$', ".");
+            GenericType::Class {
+                class_name,
+                args,
+                array_dim,
+            } => {
+                let src_name = binary_name_to_source(class_name);
                 write!(f, "{src_name}")?;
                 if !args.is_empty() {
                     write!(f, "<")?;
                     for (i, arg) in args.iter().enumerate() {
-                        if i > 0 { write!(f, ", ")?; }
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
                         write!(f, "{arg}")?;
                     }
                     write!(f, ">")?;
                 }
-                for _ in 0..*array_dim { write!(f, "[]")?; }
+                for _ in 0..*array_dim {
+                    write!(f, "[]")?;
+                }
                 Ok(())
             }
             GenericType::Array { element, dims } => {
                 write!(f, "{element}")?;
-                for _ in 0..*dims { write!(f, "[]")?; }
+                for _ in 0..*dims {
+                    write!(f, "[]")?;
+                }
                 Ok(())
             }
         }
@@ -368,10 +437,10 @@ impl fmt::Display for TypeArg {
         match self {
             TypeArg::Wildcard => write!(f, "?"),
             TypeArg::Bounded { wildcard, ty } => match wildcard {
-                Wildcard::None    => write!(f, "{ty}"),
+                Wildcard::None => write!(f, "{ty}"),
                 Wildcard::Extends => write!(f, "? extends {ty}"),
-                Wildcard::Super   => write!(f, "? super {ty}"),
-                Wildcard::Any     => write!(f, "?"),
+                Wildcard::Super => write!(f, "? super {ty}"),
+                Wildcard::Any => write!(f, "?"),
             },
         }
     }
@@ -387,8 +456,11 @@ impl fmt::Display for TypeParam {
             }
         } else {
             for (i, ib) in self.iface_bounds.iter().enumerate() {
-                if i == 0 { write!(f, " extends {ib}")?; }
-                else       { write!(f, " & {ib}")?; }
+                if i == 0 {
+                    write!(f, " extends {ib}")?;
+                } else {
+                    write!(f, " & {ib}")?;
+                }
             }
         }
         Ok(())

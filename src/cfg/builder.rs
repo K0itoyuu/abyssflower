@@ -7,11 +7,11 @@
 ///   4. Add exception edges from the Code attribute's exception table.
 use std::collections::HashMap;
 
+use crate::cfg::block::{BasicBlock, BlockId, ExceptionRange, ENTRY_BLOCK, EXIT_BLOCK};
+use crate::cfg::Cfg;
 use crate::classfile::attribute::{CodeAttribute, ExceptionHandler};
 use crate::classfile::instruction::Instruction;
 use crate::classfile::opcodes::opc;
-use crate::cfg::block::{BasicBlock, BlockId, ExceptionRange, ENTRY_BLOCK, EXIT_BLOCK};
-use crate::cfg::Cfg;
 
 // ── public entry point ─────────────────────────────────────────────────────
 
@@ -42,8 +42,7 @@ pub fn build(code: &CodeAttribute) -> Cfg {
     let mut slice_start = 0usize;
     let mut i = 0usize;
     while i <= insns.len() {
-        let is_boundary = i == insns.len()
-            || (i > 0 && leaders.contains(&insns[i].offset));
+        let is_boundary = i == insns.len() || (i > 0 && leaders.contains(&insns[i].offset));
 
         if is_boundary && i > slice_start {
             let block_insns: Vec<Instruction> = insns[slice_start..i].to_vec();
@@ -75,7 +74,8 @@ pub fn build(code: &CodeAttribute) -> Cfg {
 
     // ── helper: offset → BlockId ─────────────────────────────────────────
     // Build offset → block-id map for fast lookup during edge construction.
-    let offset_to_block_id: HashMap<u32, BlockId> = blocks.iter()
+    let offset_to_block_id: HashMap<u32, BlockId> = blocks
+        .iter()
         .filter(|b| !b.is_synthetic())
         .map(|b| (b.start_offset, b.id))
         .collect();
@@ -87,13 +87,17 @@ pub fn build(code: &CodeAttribute) -> Cfg {
 
     // ── step 4: regular edges ────────────────────────────────────────────
     // We need a snapshot of block ids to avoid borrow issues
-    let block_ids_and_last: Vec<(BlockId, Option<Instruction>)> = blocks.iter()
+    let block_ids_and_last: Vec<(BlockId, Option<Instruction>)> = blocks
+        .iter()
         .filter(|b| !b.is_synthetic())
         .map(|b| (b.id, b.last_insn().cloned()))
         .collect();
 
     for (blk_id, last_opt) in &block_ids_and_last {
-        let last = match last_opt { Some(i) => i, None => continue };
+        let last = match last_opt {
+            Some(i) => i,
+            None => continue,
+        };
         let blk_id = *blk_id;
 
         // Branch targets
@@ -106,7 +110,8 @@ pub fn build(code: &CodeAttribute) -> Cfg {
 
         // Fall-through
         if last.can_fall_through() {
-            let fall_offset = last.offset + last.kind.encoded_length(last.opcode, last.offset) as u32;
+            let fall_offset =
+                last.offset + last.kind.encoded_length(last.opcode, last.offset) as u32;
             if let Some(&succ_id) = offset_to_block_id.get(&fall_offset) {
                 add_edge(&mut blocks, blk_id, succ_id);
             }
@@ -123,7 +128,7 @@ pub fn build(code: &CodeAttribute) -> Cfg {
 
     for handler in &code.exception_table {
         let start = handler.start_pc as u32;
-        let end   = handler.end_pc   as u32;
+        let end = handler.end_pc as u32;
 
         let handler_id = match offset_to_block_id.get(&(handler.handler_pc as u32)) {
             Some(&id) => id,
@@ -133,10 +138,11 @@ pub fn build(code: &CodeAttribute) -> Cfg {
         // Add exception edges from every block whose bytecode range
         // intersects [start_pc, end_pc).
         for blk in blocks.iter_mut().filter(|b| !b.is_synthetic()) {
-            if blk.start_offset >= start && blk.start_offset < end {
-                if !blk.succ_exceptions.contains(&handler_id) {
-                    blk.succ_exceptions.push(handler_id);
-                }
+            if blk.start_offset >= start
+                && blk.start_offset < end
+                && !blk.succ_exceptions.contains(&handler_id)
+            {
+                blk.succ_exceptions.push(handler_id);
             }
         }
         // Add pred_exception edges to handler
@@ -148,16 +154,17 @@ pub fn build(code: &CodeAttribute) -> Cfg {
         }
 
         exception_ranges.push(ExceptionRange {
-            start_pc:   start,
-            end_pc:     end,
-            handler:    handler_id,
+            start_pc: start,
+            end_pc: end,
+            handler: handler_id,
             catch_type: handler.catch_type.clone(),
         });
     }
 
     // Second pass: fill pred_exceptions
     // Collect all (protected_block_id, handler_id) pairs first
-    let exc_edges: Vec<(BlockId, BlockId)> = blocks.iter()
+    let exc_edges: Vec<(BlockId, BlockId)> = blocks
+        .iter()
         .filter(|b| !b.is_synthetic())
         .flat_map(|b| b.succ_exceptions.iter().map(move |&h| (b.id, h)))
         .collect();
@@ -169,13 +176,19 @@ pub fn build(code: &CodeAttribute) -> Cfg {
         }
     }
 
-    Cfg { blocks, exception_ranges }
+    Cfg {
+        blocks,
+        exception_ranges,
+    }
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
 /// Collect the set of bytecode offsets that start a new basic block.
-fn find_leaders(insns: &[Instruction], exc_table: &[ExceptionHandler]) -> std::collections::HashSet<u32> {
+fn find_leaders(
+    insns: &[Instruction],
+    exc_table: &[ExceptionHandler],
+) -> std::collections::HashSet<u32> {
     let mut leaders = std::collections::HashSet::new();
 
     // First instruction is always a leader
@@ -186,14 +199,12 @@ fn find_leaders(insns: &[Instruction], exc_table: &[ExceptionHandler]) -> std::c
     // Exception handler start, guarded range start and end
     for handler in exc_table {
         leaders.insert(handler.start_pc as u32);
-        leaders.insert(handler.end_pc   as u32);
+        leaders.insert(handler.end_pc as u32);
         leaders.insert(handler.handler_pc as u32);
     }
 
     // Build offset set for quick "offset is valid" checks
-    let valid_offsets: std::collections::HashSet<u32> = insns.iter()
-        .map(|i| i.offset)
-        .collect();
+    let valid_offsets: std::collections::HashSet<u32> = insns.iter().map(|i| i.offset).collect();
 
     for insn in insns {
         let targets = insn.kind.branch_targets(insn.offset, insn.opcode);
@@ -203,7 +214,10 @@ fn find_leaders(insns: &[Instruction], exc_table: &[ExceptionHandler]) -> std::c
 
         // Instruction after a branch / return / throw is a new leader
         let falls = insn.can_fall_through();
-        let is_branch = !insn.kind.branch_targets(insn.offset, insn.opcode).is_empty();
+        let is_branch = !insn
+            .kind
+            .branch_targets(insn.offset, insn.opcode)
+            .is_empty();
         if is_branch || !falls {
             let next = insn.offset + insn.kind.encoded_length(insn.opcode, insn.offset) as u32;
             if valid_offsets.contains(&next) {
@@ -216,13 +230,16 @@ fn find_leaders(insns: &[Instruction], exc_table: &[ExceptionHandler]) -> std::c
 }
 
 /// Add a directed edge from `from` to `to`, updating both pred and succ lists.
-fn add_edge(blocks: &mut Vec<BasicBlock>, from: BlockId, to: BlockId) {
+fn add_edge(blocks: &mut [BasicBlock], from: BlockId, to: BlockId) {
     // Avoid duplicate edges
-    let already = blocks.iter()
+    let already = blocks
+        .iter()
         .find(|b| b.id == from)
         .map(|b| b.succs.contains(&to))
         .unwrap_or(false);
-    if already { return; }
+    if already {
+        return;
+    }
 
     // Add to → preds
     if let Some(to_block) = blocks.iter_mut().find(|b| b.id == to) {
@@ -239,9 +256,14 @@ fn add_edge(blocks: &mut Vec<BasicBlock>, from: BlockId, to: BlockId) {
 }
 
 fn is_exit_opcode(op: u8) -> bool {
-    matches!(op,
-        opc::ireturn | opc::lreturn | opc::freturn |
-        opc::dreturn | opc::areturn | opc::r#return |
-        opc::athrow
+    matches!(
+        op,
+        opc::ireturn
+            | opc::lreturn
+            | opc::freturn
+            | opc::dreturn
+            | opc::areturn
+            | opc::r#return
+            | opc::athrow
     )
 }

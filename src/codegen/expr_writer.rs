@@ -1,45 +1,61 @@
-/// Pretty-printer for Java expressions (`Expr` nodes).
-///
-/// Handles operator precedence, parenthesisation, and name formatting.
-use std::fmt::Write;
+//! Pretty-printer for Java expressions with precedence and name formatting.
+
 use crate::ir::expr::*;
-use crate::types::java_type::JavaType;
+use crate::types::java_type::{binary_name_to_source, JavaType};
 
 // ── IndentWriter ──────────────────────────────────────────────────────────
 
 pub struct IndentWriter {
-    buf:    String,
+    buf: String,
     indent: usize,
-    step:   usize,
+    step: usize,
 }
 
 impl IndentWriter {
     pub fn new(indent_size: usize) -> Self {
-        IndentWriter { buf: String::new(), indent: 0, step: indent_size }
+        IndentWriter {
+            buf: String::new(),
+            indent: 0,
+            step: indent_size,
+        }
     }
 
-    pub fn indent(&mut self)   { self.indent += self.step; }
-    pub fn dedent(&mut self)   { self.indent = self.indent.saturating_sub(self.step); }
+    pub fn indent(&mut self) {
+        self.indent += self.step;
+    }
+    pub fn dedent(&mut self) {
+        self.indent = self.indent.saturating_sub(self.step);
+    }
 
     pub fn line(&mut self, s: &str) {
-        for _ in 0..self.indent { self.buf.push(' '); }
+        for _ in 0..self.indent {
+            self.buf.push(' ');
+        }
         self.buf.push_str(s);
         self.buf.push('\n');
     }
 
-    pub fn push_str(&mut self, s: &str) { self.buf.push_str(s); }
+    pub fn push_str(&mut self, s: &str) {
+        self.buf.push_str(s);
+    }
 
     /// Current length of the emitted buffer — use with `drop_line_if` to
     /// retroactively remove a line emitted after this point.
-    pub fn len(&self) -> usize { self.buf.len() }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
 
-    pub fn is_empty(&self) -> bool { self.buf.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
 
     /// If the first line emitted after byte offset `from` satisfies `pred`,
     /// remove that line from the buffer.  Used to suppress redundant
     /// synthesised assignments (e.g. a catch parameter's self-assignment).
     pub fn drop_line_if<F: Fn(&str) -> bool>(&mut self, from: usize, pred: F) {
-        if from >= self.buf.len() { return; }
+        if from >= self.buf.len() {
+            return;
+        }
         let tail = &self.buf[from..];
         let Some(nl) = tail.find('\n') else { return };
         let first = &tail[..nl];
@@ -48,7 +64,9 @@ impl IndentWriter {
         }
     }
 
-    pub fn finish(self) -> String { self.buf }
+    pub fn finish(self) -> String {
+        self.buf
+    }
 }
 
 // ── Expression rendering ──────────────────────────────────────────────────
@@ -109,10 +127,12 @@ fn render_expr_inner(expr: &Expr) -> String {
         // ── arithmetic / logical ──────────────────────────────────────
         Expr::BinOp(op, lhs, rhs) => {
             let prec = op.precedence();
-            format!("{} {} {}",
+            format!(
+                "{} {} {}",
                 render_expr_prec(lhs, prec),
                 op.symbol(),
-                render_expr_prec(rhs, prec))
+                render_expr_prec(rhs, prec)
+            )
         }
 
         Expr::UnOp(op, operand) => {
@@ -127,71 +147,125 @@ fn render_expr_inner(expr: &Expr) -> String {
                 }
                 _ => {
                     // Primitive narrowing/widening — emit explicit cast
-                    format!("({}){}", render_cast_type(*kind), render_expr_prec(inner, 1))
+                    format!(
+                        "({}){}",
+                        render_cast_type(*kind),
+                        render_expr_prec(inner, 1)
+                    )
                 }
             }
         }
 
-        Expr::Ternary { cond, then_expr, else_expr } => {
+        Expr::Ternary {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond = match cond {
+                TernaryCondition::Rendered(cond) => cond.clone(),
+                TernaryCondition::Expression(cond) => render_expr(cond),
+            };
             // `?:` is right-associative: the false arm may nest another
             // ternary without parentheses, the true arm may not.
-            format!("{} ? {} : {}",
+            format!(
+                "{} ? {} : {}",
                 cond,
                 render_expr_prec(then_expr, 12),
-                render_expr_prec(else_expr, 13))
+                render_expr_prec(else_expr, 13)
+            )
+        }
+
+        Expr::SwitchExpression { selector, arms } => {
+            let rendered_arms = arms
+                .iter()
+                .map(|(value, expr)| match value {
+                    Some(value) => format!("case {value} -> {};", render_expr(expr)),
+                    None => format!("default -> {};", render_expr(expr)),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("switch ({}) {{ {} }}", render_expr(selector), rendered_arms)
         }
 
         Expr::InstanceOf(obj, ty) => {
-            format!("{} instanceof {}",
+            format!(
+                "{} instanceof {}",
                 render_expr_prec(obj, 6),
-                render_type(ty))
+                render_type(ty)
+            )
         }
 
         // ── field access ──────────────────────────────────────────────
-        Expr::Field { dir: FieldDir::Get, owner, name, object, .. } => {
-            match object {
-                Some(obj) => format!("{}.{}", render_expr_prec(obj, 0), name),
-                None      => format!("{}.{}", simple_name(owner), name),
-            }
-        }
+        Expr::Field {
+            dir: FieldDir::Get,
+            owner,
+            name,
+            object,
+            ..
+        } => match object {
+            Some(obj) => format!("{}.{}", render_expr_prec(obj, 0), name),
+            None => format!("{}.{}", simple_name(owner), name),
+        },
 
-        Expr::Field { dir: FieldDir::Put, owner, name, object, value, descriptor } => {
+        Expr::Field {
+            dir: FieldDir::Put,
+            owner,
+            name,
+            object,
+            value,
+            descriptor,
+        } => {
             let lhs = match object {
                 Some(obj) => format!("{}.{}", render_expr_prec(obj, 0), name),
-                None      => format!("{}.{}", simple_name(owner), name),
+                None => format!("{}.{}", simple_name(owner), name),
             };
             // A boolean field assigned from iconst_0/1 should read false/true.
-            let rhs = value.as_ref()
+            let rhs = value
+                .as_ref()
                 .map(|v| render_value_for_descriptor(v, descriptor))
                 .unwrap_or_default();
             format!("{} = {}", lhs, rhs)
         }
 
         // ── method invocations ────────────────────────────────────────
-        Expr::Invoke { kind, owner, name, object, args, .. } => {
-            let args_str = args.iter()
-                .map(render_expr)
-                .collect::<Vec<_>>()
-                .join(", ");
+        Expr::Invoke {
+            kind,
+            owner,
+            name,
+            object,
+            args,
+            ..
+        } => {
+            let args_str = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             match (kind, object) {
-                (InvokeKind::Static, _) =>
-                    format!("{}.{}({})", simple_name(owner), name, args_str),
+                (InvokeKind::Static, _) => format!("{}.{}({})", simple_name(owner), name, args_str),
                 (InvokeKind::Special, Some(obj)) if name == "<init>" => {
                     // <init> calls are handled at the new-object level; fallback
                     format!("{}.{}({})", render_expr_prec(obj, 0), name, args_str)
                 }
-                (_, Some(obj)) =>
-                    format!("{}.{}({})", render_expr_prec(obj, 0), name, args_str),
-                (_, None) =>
-                    format!("{}.{}({})", simple_name(owner), name, args_str),
+                (_, Some(obj)) => format!("{}.{}({})", render_expr_prec(obj, 0), name, args_str),
+                (_, None) => format!("{}.{}({})", simple_name(owner), name, args_str),
             }
         }
 
-        Expr::InvokeDynamic { name, args, bootstrap_index, .. } => {
+        Expr::InvokeDynamic {
+            name,
+            args,
+            concat_recipe,
+            lambda_body,
+            ..
+        } => {
             // Desugar Java 9+ string concatenation factory into + chain.
             if name == "makeConcatWithConstants" || name == "makeConcat" {
                 let strip = |a: &Expr| -> String {
-                    if let Expr::Invoke { kind: InvokeKind::Static, owner, name: vname, args: vargs, .. } = a {
+                    if let Expr::Invoke {
+                        kind: InvokeKind::Static,
+                        owner,
+                        name: vname,
+                        args: vargs,
+                        ..
+                    } = a
+                    {
                         if vname == "valueOf" && owner == "java/lang/String" && vargs.len() == 1 {
                             return render_expr(&vargs[0]);
                         }
@@ -199,29 +273,34 @@ fn render_expr_inner(expr: &Expr) -> String {
                     render_expr(a)
                 };
 
-                // Use the recipe string (set by set_concat_recipes) when available.
-                if let Some(recipe) = crate::ir::stack_sim::get_concat_recipe(*bootstrap_index) {
-                    let mut result  = String::new();
+                if let Some(recipe) = concat_recipe {
+                    let mut result = String::new();
                     let mut literal = String::new();
-                    let mut arg_it  = args.iter();
+                    let mut arg_it = args.iter();
 
                     for ch in recipe.chars() {
                         match ch {
                             '\u{0001}' => {
                                 if !literal.is_empty() {
-                                    if !result.is_empty() { result.push_str(" + "); }
+                                    if !result.is_empty() {
+                                        result.push_str(" + ");
+                                    }
                                     result.push('"');
-                                    result.push_str(&literal
-                                        .replace('\\', "\\\\")
-                                        .replace('"',  "\\\"")
-                                        .replace('\n', "\\n")
-                                        .replace('\r', "\\r")
-                                        .replace('\t', "\\t"));
+                                    result.push_str(
+                                        &literal
+                                            .replace('\\', "\\\\")
+                                            .replace('"', "\\\"")
+                                            .replace('\n', "\\n")
+                                            .replace('\r', "\\r")
+                                            .replace('\t', "\\t"),
+                                    );
                                     result.push('"');
                                     literal.clear();
                                 }
                                 if let Some(arg) = arg_it.next() {
-                                    if !result.is_empty() { result.push_str(" + "); }
+                                    if !result.is_empty() {
+                                        result.push_str(" + ");
+                                    }
                                     result.push_str(&strip(arg));
                                 }
                             }
@@ -234,14 +313,18 @@ fn render_expr_inner(expr: &Expr) -> String {
                         }
                     }
                     if !literal.is_empty() {
-                        if !result.is_empty() { result.push_str(" + "); }
+                        if !result.is_empty() {
+                            result.push_str(" + ");
+                        }
                         result.push('"');
-                        result.push_str(&literal
-                            .replace('\\', "\\\\")
-                            .replace('"',  "\\\"")
-                            .replace('\n', "\\n")
-                            .replace('\r', "\\r")
-                            .replace('\t', "\\t"));
+                        result.push_str(
+                            &literal
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"")
+                                .replace('\n', "\\n")
+                                .replace('\r', "\\r")
+                                .replace('\t', "\\t"),
+                        );
                         result.push('"');
                     }
                     if !result.is_empty() {
@@ -258,11 +341,34 @@ fn render_expr_inner(expr: &Expr) -> String {
 
             // Desugar LambdaMetafactory invokedynamic → () -> expr
             // Look up the pre-compiled lambda body by bootstrap_attr_index.
-            let lambda_body = crate::codegen::class_writer::LAMBDA_BOOTSTRAP.with(|cache| {
-                cache.borrow().get(bootstrap_index).cloned()
-            });
-            if let Some(body) = lambda_body {
-                return body;
+            if let Some(lambda) = lambda_body {
+                return match lambda {
+                    LambdaBootstrap::Lambda(body) => body.clone(),
+                    LambdaBootstrap::KotlinLambda { body, .. } => body.clone(),
+                    LambdaBootstrap::MethodReference {
+                        reference_kind,
+                        owner,
+                        name,
+                        ..
+                    } => match *reference_kind {
+                        // REF_newInvokeSpecial
+                        8 => format!("{}::new", simple_name(owner)),
+                        // REF_invokeStatic
+                        6 => format!("{}::{}", simple_name(owner), name),
+                        // A captured call-site argument is the receiver of a bound
+                        // virtual/interface/special method reference.
+                        5 | 7 | 9 if !args.is_empty() => {
+                            format!("{}::{}", render_expr_prec(&args[0], 0), name)
+                        }
+                        5 | 7 | 9 => format!("{}::{}", simple_name(owner), name),
+                        _ => format!(
+                            "/*method-handle-{}*/ {}::{}",
+                            reference_kind,
+                            simple_name(owner),
+                            name
+                        ),
+                    },
+                };
             }
 
             let args_str = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
@@ -274,18 +380,29 @@ fn render_expr_inner(expr: &Expr) -> String {
             format!("{}[{}]", render_expr_prec(array, 0), render_expr(index))
         }
 
-        Expr::ArrayStore { array, index, value } => {
-            format!("{}[{}] = {}",
+        Expr::ArrayStore {
+            array,
+            index,
+            value,
+        } => {
+            format!(
+                "{}[{}] = {}",
                 render_expr_prec(array, 0),
                 render_expr(index),
-                render_expr(value))
+                render_expr(value)
+            )
         }
 
         Expr::ArrayLength(arr) => {
             format!("{}.length", render_expr_prec(arr, 0))
         }
 
-        Expr::NewArray { kind, type_, dimensions, initializer } => {
+        Expr::NewArray {
+            kind,
+            type_,
+            dimensions,
+            initializer,
+        } => {
             // `new Foo[]{a, b, c}` — the size is implied by the element list.
             if let Some(elems) = initializer {
                 let inner: Vec<String> = elems.iter().map(render_expr).collect();
@@ -304,7 +421,9 @@ fn render_expr_inner(expr: &Expr) -> String {
         }
 
         // ── object creation ───────────────────────────────────────────
-        Expr::New { class_name, args, .. } => {
+        Expr::New {
+            class_name, args, ..
+        } => {
             let args_str = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("new {}({})", simple_name(class_name), args_str)
         }
@@ -318,32 +437,35 @@ fn render_expr_inner(expr: &Expr) -> String {
         Expr::IInc { slot, delta, name } => {
             let fallback = format!("var{}", slot);
             let var = name.as_deref().unwrap_or(&fallback);
-            if *delta == 1  { format!("{}++", var) }
-            else if *delta == -1 { format!("{}--", var) }
-            else if *delta > 0  { format!("{} += {}", var, delta) }
-            else { format!("{} -= {}", var, -delta) }
+            if *delta == 1 {
+                format!("{}++", var)
+            } else if *delta == -1 {
+                format!("{}--", var)
+            } else if *delta > 0 {
+                format!("{} += {}", var, delta)
+            } else {
+                format!("{} -= {}", var, -delta)
+            }
         }
 
         Expr::Monitor { enter, object } => {
-            if *enter { format!("/*monitorenter*/ {}", render_expr(object)) }
-            else      { format!("/*monitorexit*/  {}", render_expr(object)) }
+            if *enter {
+                format!("/*monitorenter*/ {}", render_expr(object))
+            } else {
+                format!("/*monitorexit*/  {}", render_expr(object))
+            }
         }
 
         Expr::Throw(exc) => format!("throw {}", render_expr(exc)),
 
         Expr::Return(Some(val)) => {
-            // In a boolean-returning method, `ireturn 0/1` means false/true.
-            if crate::ir::stack_sim::current_return_is_boolean() {
-                if let Some(b) = int_const_as_bool(val) {
-                    return format!("return {}", b);
-                }
-            }
             format!("return {}", render_expr(val))
         }
-        Expr::Return(None)      => "return".into(),
+        Expr::Return(None) => "return".into(),
 
-        Expr::Opaque { opcode, offset } =>
-            format!("/*opaque opcode=0x{:02x} @{}*/", opcode, offset),
+        Expr::Opaque { opcode, offset } => {
+            format!("/*opaque opcode=0x{:02x} @{}*/", opcode, offset)
+        }
     }
 }
 
@@ -353,19 +475,23 @@ fn render_const(c: &ConstExpr) -> String {
     match &c.value {
         ConstValue::Int(v) => {
             if c.ty == JavaType::BOOLEAN {
-                if *v == 0 { "false".into() } else { "true".into() }
+                if *v == 0 {
+                    "false".into()
+                } else {
+                    "true".into()
+                }
             } else if c.ty == JavaType::CHAR && *v >= 32 && *v < 127 {
                 format!("'{}'", *v as u8 as char)
             } else {
                 v.to_string()
             }
         }
-        ConstValue::Long(v)   => format!("{}L", v),
-        ConstValue::Float(v)  => format!("{}f", v),
+        ConstValue::Long(v) => format!("{}L", v),
+        ConstValue::Float(v) => format!("{}f", v),
         ConstValue::Double(v) => format!("{}d", v),
         ConstValue::StringRef(s) => format!("\"{}\"", s.replace('"', "\\\"").replace('\n', "\\n")),
-        ConstValue::ClassRef(s)  => format!("{}.class", simple_name(s)),
-        ConstValue::Null         => "null".into(),
+        ConstValue::ClassRef(s) => format!("{}.class", simple_name(s)),
+        ConstValue::Null => "null".into(),
     }
 }
 
@@ -375,17 +501,26 @@ pub fn render_type(ty: &JavaType) -> String {
 
 fn render_cast_type(kind: CastKind) -> &'static str {
     match kind {
-        CastKind::I2L => "long",   CastKind::I2F => "float",  CastKind::I2D => "double",
-        CastKind::L2I => "int",    CastKind::L2F => "float",  CastKind::L2D => "double",
-        CastKind::F2I => "int",    CastKind::F2L => "long",   CastKind::F2D => "double",
-        CastKind::D2I => "int",    CastKind::D2L => "long",   CastKind::D2F => "float",
-        CastKind::I2B => "byte",   CastKind::I2C => "char",   CastKind::I2S => "short",
+        CastKind::I2L => "long",
+        CastKind::I2F => "float",
+        CastKind::I2D => "double",
+        CastKind::L2I => "int",
+        CastKind::L2F => "float",
+        CastKind::L2D => "double",
+        CastKind::F2I => "int",
+        CastKind::F2L => "long",
+        CastKind::F2D => "double",
+        CastKind::D2I => "int",
+        CastKind::D2L => "long",
+        CastKind::D2F => "float",
+        CastKind::I2B => "byte",
+        CastKind::I2C => "char",
+        CastKind::I2S => "short",
         CastKind::CheckCast => "",
     }
 }
 
 /// `java/lang/String` → `String`
 pub fn simple_name(binary: &str) -> String {
-    binary.rsplit('/').next().unwrap_or(binary)
-        .replace('$', ".")
+    binary_name_to_source(binary.rsplit('/').next().unwrap_or(binary))
 }

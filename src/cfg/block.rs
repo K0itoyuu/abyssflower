@@ -10,7 +10,7 @@ use crate::classfile::instruction::Instruction;
 pub type BlockId = u32;
 
 pub const ENTRY_BLOCK: BlockId = 0;
-pub const EXIT_BLOCK:  BlockId = u32::MAX;
+pub const EXIT_BLOCK: BlockId = u32::MAX;
 
 // ── ExceptionEdge ─────────────────────────────────────────────────────────
 
@@ -19,13 +19,13 @@ pub const EXIT_BLOCK:  BlockId = u32::MAX;
 #[derive(Debug, Clone)]
 pub struct ExceptionRange {
     /// Inclusive start bytecode offset of the guarded region.
-    pub start_pc:     u32,
+    pub start_pc: u32,
     /// Exclusive end bytecode offset.
-    pub end_pc:       u32,
+    pub end_pc: u32,
     /// Block that handles the exception.
-    pub handler:      BlockId,
+    pub handler: BlockId,
     /// Caught type, `None` = catch-all (finally).
-    pub catch_type:   Option<String>,
+    pub catch_type: Option<String>,
 }
 
 // ── BasicBlock ────────────────────────────────────────────────────────────
@@ -40,12 +40,12 @@ pub struct BasicBlock {
     /// Bytecode offset of the first instruction (or 0 for entry/exit).
     pub start_offset: u32,
     /// Bytecode offset *past the end* of the last instruction.
-    pub end_offset:   u32,
+    pub end_offset: u32,
 
     /// Regular predecessor blocks (fall-through or jump).
-    pub preds:      Vec<BlockId>,
+    pub preds: Vec<BlockId>,
     /// Regular successor blocks.
-    pub succs:      Vec<BlockId>,
+    pub succs: Vec<BlockId>,
 
     /// Predecessor blocks that reach this one via an exception edge.
     pub pred_exceptions: Vec<BlockId>,
@@ -58,17 +58,18 @@ impl BasicBlock {
     pub fn new(id: BlockId, instructions: Vec<Instruction>) -> Self {
         let start_offset = instructions.first().map(|i| i.offset).unwrap_or(0);
         let last = instructions.last();
-        let end_offset = last.map(|i| i.offset + i.kind.encoded_length(i.opcode, i.offset) as u32)
-                             .unwrap_or(0);
+        let end_offset = last
+            .map(|i| i.offset + i.kind.encoded_length(i.opcode, i.offset) as u32)
+            .unwrap_or(0);
         BasicBlock {
             id,
             instructions,
             start_offset,
             end_offset,
-            preds:            Vec::new(),
-            succs:            Vec::new(),
-            pred_exceptions:  Vec::new(),
-            succ_exceptions:  Vec::new(),
+            preds: Vec::new(),
+            succs: Vec::new(),
+            pred_exceptions: Vec::new(),
+            succ_exceptions: Vec::new(),
         }
     }
 
@@ -76,13 +77,13 @@ impl BasicBlock {
     pub fn synthetic(id: BlockId) -> Self {
         BasicBlock {
             id,
-            instructions:     Vec::new(),
-            start_offset:     0,
-            end_offset:       0,
-            preds:            Vec::new(),
-            succs:            Vec::new(),
-            pred_exceptions:  Vec::new(),
-            succ_exceptions:  Vec::new(),
+            instructions: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+            preds: Vec::new(),
+            succs: Vec::new(),
+            pred_exceptions: Vec::new(),
+            succ_exceptions: Vec::new(),
         }
     }
 
